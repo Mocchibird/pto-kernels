@@ -1,4 +1,6 @@
 #include <pto/pto-inst.hpp>
+#include <acl/acl.h>
+#include <algorithm>
 
 using namespace pto;
 
@@ -298,24 +300,140 @@ extern "C" __global__ AICORE void matmul_kernel_ABt(__gm__ uint8_t* x,
 }
 
 // ===========================================================================
+// Host-side helpers
+// ===========================================================================
+namespace {
+
+constexpr int H_M_TILE = 128;
+constexpr int H_N_TILE = 256;
+constexpr int H_K_TILE = 512;
+
+inline int round_up(int v, int tile) {
+  return ((v + tile - 1) / tile) * tile;
+}
+
+inline uint32_t choose_block_dim(int m_pad, int n_pad, uint32_t max_block_dim) {
+  int m_loop = m_pad / H_M_TILE;
+  int n_loop = n_pad / H_N_TILE;
+  int core_loop = m_loop * n_loop;
+  if (core_loop <= 0) return 1;
+  return static_cast<uint32_t>(
+      std::max(1, std::min(core_loop, static_cast<int>(max_block_dim))));
+}
+
+// Copy a sub-region of a row-major matrix (rows × cols, stride=cols) into a
+// larger zero-padded buffer (dst_rows × dst_cols, stride=dst_cols).
+// The destination must already be zeroed.
+void copy_to_padded(void* dst, int dst_cols, const void* src, int rows,
+                    int cols, aclrtStream stream) {
+  constexpr size_t elem = sizeof(uint16_t);  // half
+  if (cols == dst_cols) {
+    size_t bytes = static_cast<size_t>(rows) * cols * elem;
+    aclrtMemcpyAsync(dst, bytes, src, bytes, ACL_MEMCPY_DEVICE_TO_DEVICE,
+                     stream);
+  } else {
+    for (int r = 0; r < rows; ++r) {
+      size_t row_bytes = static_cast<size_t>(cols) * elem;
+      auto s = static_cast<const uint8_t*>(src) + r * cols * elem;
+      auto d = static_cast<uint8_t*>(dst) + r * dst_cols * elem;
+      aclrtMemcpyAsync(d, row_bytes, s, row_bytes,
+                       ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+    }
+  }
+}
+
+// Copy the valid region (rows × dst_cols) from a padded buffer
+// (src has stride src_cols) back to the output (dst has stride dst_cols).
+void copy_from_padded(void* dst, int rows, int dst_cols, const void* src,
+                      int src_cols, aclrtStream stream) {
+  constexpr size_t elem = sizeof(uint16_t);
+  if (src_cols == dst_cols) {
+    size_t bytes = static_cast<size_t>(rows) * dst_cols * elem;
+    aclrtMemcpyAsync(dst, bytes, src, bytes, ACL_MEMCPY_DEVICE_TO_DEVICE,
+                     stream);
+  } else {
+    for (int r = 0; r < rows; ++r) {
+      size_t row_bytes = static_cast<size_t>(dst_cols) * elem;
+      auto s = static_cast<const uint8_t*>(src) + r * src_cols * elem;
+      auto d = static_cast<uint8_t*>(dst) + r * dst_cols * elem;
+      aclrtMemcpyAsync(d, row_bytes, s, row_bytes,
+                       ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
+    }
+  }
+}
+
+}  // anonymous namespace
+
+// ===========================================================================
 // Host launcher
 // ===========================================================================
 /**
  * @brief Host launcher for matmul kernel.
- * @param blockDim          Number of kernel blocks (cores) to launch.
+ *
+ * Handles padding to tile boundaries internally:
+ *   M → multiple of 128, N → multiple of 256, K → multiple of 512.
+ * When the original dimensions are already aligned the kernel is launched
+ * directly on the caller's buffers with zero overhead.
+ *
+ * @param maxBlockDim       Upper bound on the number of kernel blocks (cores).
  * @param stream            Execution stream handle.
  * @param x                 Pointer to A matrix in global memory (M × K).
  * @param y                 Pointer to B matrix in global memory (N × K).
  * @param z                 Pointer to C output in global memory (M × N).
- * @param M                 Number of rows in A and C.
- * @param N                 Number of rows in B (columns of C).
- * @param K                 Number of columns in A and B.
+ * @param M                 Number of rows in A and C (original, unpadded).
+ * @param N                 Number of rows in B / columns of C (original).
+ * @param K                 Number of columns in A and B (original).
  * @param swizzle_direction Swizzle direction: 0=Zn, 1=Nz.
- * @param swizzle_count     Number of tiles per swizzle group; <=0 disables swizzle.
+ * @param swizzle_count     Tiles per swizzle group; <=0 disables swizzle.
  */
-extern "C" void call_kernel(uint32_t blockDim, void* stream, uint8_t* x,
+extern "C" void call_kernel(uint32_t maxBlockDim, void* stream, uint8_t* x,
                             uint8_t* y, uint8_t* z, int M, int N, int K,
                             int swizzle_direction, int swizzle_count) {
+  int M_pad = round_up(M, H_M_TILE);
+  int N_pad = round_up(N, H_N_TILE);
+  int K_pad = round_up(K, H_K_TILE);
+  uint32_t blockDim = choose_block_dim(M_pad, N_pad, maxBlockDim);
+
+  bool needs_pad = (M_pad != M || N_pad != N || K_pad != K);
+
+  if (!needs_pad) {
+    matmul_kernel_ABt<<<blockDim, nullptr, stream>>>(
+        x, y, z, M, N, K, swizzle_direction, swizzle_count);
+    return;
+  }
+
+  auto s = static_cast<aclrtStream>(stream);
+  constexpr size_t elem = sizeof(uint16_t);
+
+  size_t a_bytes = static_cast<size_t>(M_pad) * K_pad * elem;
+  size_t b_bytes = static_cast<size_t>(N_pad) * K_pad * elem;
+  size_t c_bytes = static_cast<size_t>(M_pad) * N_pad * elem;
+
+  void *a_pad = nullptr, *b_pad = nullptr, *c_pad = nullptr;
+  aclrtMalloc(&a_pad, a_bytes, ACL_MEM_MALLOC_HUGE_FIRST);
+  aclrtMalloc(&b_pad, b_bytes, ACL_MEM_MALLOC_HUGE_FIRST);
+  aclrtMalloc(&c_pad, c_bytes, ACL_MEM_MALLOC_HUGE_FIRST);
+
+  // Zero so out-of-bounds tile reads see zero
+  aclrtMemsetAsync(a_pad, a_bytes, 0, a_bytes, s);
+  aclrtMemsetAsync(b_pad, b_bytes, 0, b_bytes, s);
+
+  // Copy original data into zero-padded workspace
+  copy_to_padded(a_pad, K_pad, x, M, K, s);
+  copy_to_padded(b_pad, K_pad, y, N, K, s);
+
+  // Launch kernel on padded workspace
   matmul_kernel_ABt<<<blockDim, nullptr, stream>>>(
-      x, y, z, M, N, K, swizzle_direction, swizzle_count);
+      static_cast<uint8_t*>(a_pad), static_cast<uint8_t*>(b_pad),
+      static_cast<uint8_t*>(c_pad), M_pad, N_pad, K_pad, swizzle_direction,
+      swizzle_count);
+
+  // Copy valid result region back to caller's output buffer
+  copy_from_padded(z, M, N, c_pad, N_pad, s);
+
+  // Synchronize before freeing workspace
+  aclrtSynchronizeStream(s);
+  aclrtFree(a_pad);
+  aclrtFree(b_pad);
+  aclrtFree(c_pad);
 }

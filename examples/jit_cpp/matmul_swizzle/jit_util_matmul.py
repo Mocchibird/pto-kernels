@@ -11,10 +11,6 @@ DEFAULT_MAX_BLOCK_DIM = int(os.environ.get("PTO_MATMUL_MAX_BLOCK_DIM", "20"))
 DEFAULT_SWIZZLE_DIRECTION = int(os.environ.get("PTO_MATMUL_SWIZZLE_DIRECTION", "1"))
 DEFAULT_SWIZZLE_COUNT = int(os.environ.get("PTO_MATMUL_SWIZZLE_COUNT", "3"))
 
-M_TILE = 128
-N_TILE = 256
-K_TILE = 512
-
 
 def compile_cpp(kernel_cpp: str, verbose: bool = False, timeout: int = 120) -> str:
     so_dir = os.path.join(os.path.dirname(kernel_cpp), "outputs", "so")
@@ -30,9 +26,15 @@ def compile_cpp(kernel_cpp: str, verbose: bool = False, timeout: int = 120) -> s
         "-std=c++17",
         "--npu-arch=dav-2201",
         f"-I{PTO_LIB_PATH}/include",
+        f"-I{ASCEND_TOOLKIT_HOME}/include",
     ]
 
-    command = ["bisheng", *flags, kernel_cpp, "-o", lib_path]
+    link_flags = [
+        f"-L{ASCEND_TOOLKIT_HOME}/lib64",
+        "-lascendcl",
+    ]
+
+    command = ["bisheng", *flags, kernel_cpp, "-o", lib_path, *link_flags]
     if verbose:
         print("compile command:", " ".join(command))
 
@@ -50,26 +52,13 @@ def torch_to_ctypes(tensor):
     return ctypes.c_void_p(tensor.data_ptr())
 
 
-def _round_up(v: int, tile: int) -> int:
-    return ((v + tile - 1) // tile) * tile
-
-
-def _choose_block_dim(m: int, n: int, max_block_dim: int) -> int:
-    m_loop = m // M_TILE
-    n_loop = n // N_TILE
-    core_loop = m_loop * n_loop
-    if core_loop <= 0:
-        return 1
-    return max(1, min(core_loop, max_block_dim))
-
-
 def load_lib(lib_path):
     lib_path = os.path.abspath(lib_path)
     lib = ctypes.CDLL(lib_path)
 
-    # call_kernel(blockDim, stream, x, y, z, M, N, K, swizzle_direction, swizzle_count)
+    # call_kernel(maxBlockDim, stream, x, y, z, M, N, K, swizzle_direction, swizzle_count)
     lib.call_kernel.argtypes = [
-        ctypes.c_uint32,  # blockDim
+        ctypes.c_uint32,  # maxBlockDim
         ctypes.c_void_p,  # stream
         ctypes.c_void_p,  # x [M, K]
         ctypes.c_void_p,  # y [N, K]
@@ -82,11 +71,11 @@ def load_lib(lib_path):
     ]
     lib.call_kernel.restype = None
 
-    def _launch_kernel_f16(
-        a, b, c, m, n, k, block_dim, stream_ptr, swizzle_direction, swizzle_count
+    def _launch_kernel(
+        a, b, c, m, n, k, max_block_dim, stream_ptr, swizzle_direction, swizzle_count
     ):
         lib.call_kernel(
-            block_dim,
+            max_block_dim,
             stream_ptr,
             torch_to_ctypes(a),
             torch_to_ctypes(b),
@@ -97,49 +86,6 @@ def load_lib(lib_path):
             swizzle_direction,
             swizzle_count,
         )
-
-    def _matmul_single(
-        a,
-        b,
-        max_block_dim,
-        stream_ptr,
-        swizzle_direction,
-        swizzle_count,
-    ):
-        m = int(a.shape[0])
-        k = int(a.shape[1])
-        n = int(b.shape[0])
-
-        m_pad = _round_up(m, M_TILE)
-        n_pad = _round_up(n, N_TILE)
-        k_pad = _round_up(k, K_TILE)
-        
-        if m_pad != m or n_pad != n or k_pad != k:
-            a_work = torch.zeros((m_pad, k_pad), device=a.device, dtype=a.dtype)
-            b_work = torch.zeros((n_pad, k_pad), device=b.device, dtype=b.dtype)
-            a_work[:m, :k] = a
-            b_work[:n, :k] = b
-        else:
-            a_work = a
-            b_work = b
-
-        c_work = torch.empty((m_pad, n_pad), device=a.device, dtype=a.dtype)
-        torch.npu.synchronize()
-
-        block_dim = _choose_block_dim(m_pad, n_pad, max_block_dim)
-        _launch_kernel_f16(
-            a_work,
-            b_work,
-            c_work,
-            m_pad,
-            n_pad,
-            k_pad,
-            block_dim,
-            stream_ptr,
-            swizzle_direction,
-            swizzle_count,
-        )
-        return c_work[:m, :n]
 
     def matmul_abt(
         a,
@@ -162,14 +108,26 @@ def load_lib(lib_path):
             stream = torch.npu.current_stream()
             stream_ptr = getattr(stream, "_as_parameter_", None)
 
-        return _matmul_single(
+        m = int(a.shape[0])
+        k = int(a.shape[1])
+        n = int(b.shape[0])
+
+        c = torch.empty((m, n), device=a.device, dtype=a.dtype)
+        torch.npu.synchronize()
+
+        _launch_kernel(
             a,
             b,
+            c,
+            m,
+            n,
+            k,
             max_block_dim,
             stream_ptr,
             int(swizzle_direction),
             int(swizzle_count),
         )
+        return c
 
     return matmul_abt
 
