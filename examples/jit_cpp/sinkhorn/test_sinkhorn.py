@@ -59,10 +59,13 @@ def sinkhorn_ref(matrix_in, order=10, lr=0.5, eps=1e-3):
 
     # Initial target
     row_std, col_std = compute_stds(cm, mu1, mu2)
-    tgt = torch.min(
-        row_std.min(dim=1, keepdim=True).values,
-        col_std.min(dim=1, keepdim=True).values,
-    ) + eps
+    tgt = (
+        torch.min(
+            row_std.min(dim=1, keepdim=True).values,
+            col_std.min(dim=1, keepdim=True).values,
+        )
+        + eps
+    )
 
     # Sinkhorn iterations
     for _ in range(order):
@@ -71,7 +74,11 @@ def sinkhorn_ref(matrix_in, order=10, lr=0.5, eps=1e-3):
         mu1 = mu1 * (col_std.unsqueeze(1) / tgt.unsqueeze(1)).pow(lr)
 
     out = cm / mu1 / mu2
-    return out.to(matrix_in.dtype), mu1.squeeze(1).to(matrix_in.dtype), mu2.squeeze(2).to(matrix_in.dtype)
+    return (
+        out.to(matrix_in.dtype),
+        mu1.squeeze(1).to(matrix_in.dtype),
+        mu2.squeeze(2).to(matrix_in.dtype),
+    )
 
 
 @pytest.fixture(scope="session")
@@ -90,10 +97,14 @@ def test_sinkhorn_matches_reference(sinkhorn_kernel, npu_device, N, K, L, order,
     mu2_out = torch.empty(N, K, device=npu_device, dtype=DTYPE)
 
     lr, eps = 0.5, 1e-3
-    sinkhorn_kernel(matrix_in, matrix_out, mu1_out, mu2_out, order=order, lr=lr, eps=eps)
+    sinkhorn_kernel(
+        matrix_in, matrix_out, mu1_out, mu2_out, order=order, lr=lr, eps=eps
+    )
     torch.npu.synchronize()
 
-    ref_out, ref_mu1, ref_mu2 = sinkhorn_ref(matrix_in.cpu(), order=order, lr=lr, eps=eps)
+    ref_out, ref_mu1, ref_mu2 = sinkhorn_ref(
+        matrix_in.cpu(), order=order, lr=lr, eps=eps
+    )
 
     # fp16 accumulation loses precision; use relaxed tolerances
     torch.testing.assert_close(matrix_out.cpu(), ref_out, rtol=5e-2, atol=1e-2)

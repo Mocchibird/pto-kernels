@@ -11,6 +11,7 @@ Writes:
   outputs/plots/head_shapes_*.png
   outputs/plots/batched_vs_serial_*.png
 """
+
 # pylint: disable=wrong-import-position
 import argparse
 import csv
@@ -49,16 +50,20 @@ KERNEL_REPEATS = 50
 
 # --- torch reference --------------------------------------------------------
 
+
 def sinq_torch_fp16(matrix, sinkhorn_order=8, sinkhorn_lr=0.9, sinkhorn_eps=1e-6):
     """Vectorised torch SINQ on (N, K, L).  Stays in fp16."""
     K, L = matrix.shape[-2], matrix.shape[-1]
     m = matrix
     mu1 = torch.ones(*matrix.shape[:-2], L, dtype=m.dtype, device=m.device)
     mu2 = torch.ones(*matrix.shape[:-2], K, 1, dtype=m.dtype, device=m.device)
-    tgt = torch.minimum(
-        m.std(dim=-1).amin(dim=-1, keepdim=True),
-        m.std(dim=-2).amin(dim=-1, keepdim=True),
-    ).unsqueeze(-1) + sinkhorn_eps
+    tgt = (
+        torch.minimum(
+            m.std(dim=-1).amin(dim=-1, keepdim=True),
+            m.std(dim=-2).amin(dim=-1, keepdim=True),
+        ).unsqueeze(-1)
+        + sinkhorn_eps
+    )
     for _ in range(sinkhorn_order):
         cur = m / mu1.unsqueeze(-2) / mu2
         mu1 = mu1 * (cur.std(dim=-2) / tgt.squeeze(-1)) ** sinkhorn_lr
@@ -67,6 +72,7 @@ def sinq_torch_fp16(matrix, sinkhorn_order=8, sinkhorn_lr=0.9, sinkhorn_eps=1e-6
 
 
 # --- timing / metric helpers ------------------------------------------------
+
 
 def time_npu(fn, warmup=KERNEL_WARMUP, repeats=KERNEL_REPEATS):
     for _ in range(warmup):
@@ -92,6 +98,7 @@ def flops_per_call(K, L, order):
 
 # --- head-shapes bench -----------------------------------------------------
 
+
 def run_head_shapes(sinq_func, stream_ptr, device):
     rows = []
     header = (
@@ -111,15 +118,26 @@ def run_head_shapes(sinq_func, stream_ptr, device):
             mu1 = torch.empty(1, L, dtype=torch.float16, device=device)
             mu2 = torch.empty(1, K, dtype=torch.float16, device=device)
 
-            t_us = time_npu(lambda: sinq_torch_fp16(
-                mat, sinkhorn_order=SINKHORN_ORDER,
-                sinkhorn_lr=SINKHORN_LR, sinkhorn_eps=SINKHORN_EPS,
-            ))
-            k_us = time_npu(lambda: sinq_func(
-                mat, out, mu1, mu2,
-                order=SINKHORN_ORDER, lr=SINKHORN_LR, eps=SINKHORN_EPS,
-                stream_ptr=stream_ptr,
-            ))
+            t_us = time_npu(
+                lambda: sinq_torch_fp16(
+                    mat,
+                    sinkhorn_order=SINKHORN_ORDER,
+                    sinkhorn_lr=SINKHORN_LR,
+                    sinkhorn_eps=SINKHORN_EPS,
+                )
+            )
+            k_us = time_npu(
+                lambda: sinq_func(
+                    mat,
+                    out,
+                    mu1,
+                    mu2,
+                    order=SINKHORN_ORDER,
+                    lr=SINKHORN_LR,
+                    eps=SINKHORN_EPS,
+                    stream_ptr=stream_ptr,
+                )
+            )
 
             B = bytes_per_call(K, L, 2)
             F = flops_per_call(K, L, SINKHORN_ORDER)
@@ -135,21 +153,31 @@ def run_head_shapes(sinq_func, stream_ptr, device):
                 f"{k_us:>9.2f} {k_gbs:>10.3f} {k_gflops:>12.3f} | "
                 f"{speedup:>7.2f}"
             )
-            rows.append({
-                "K": K, "L": L,
-                "torch_us": t_us, "torch_GB_s": t_gbs, "torch_GFLOPS": t_gflops,
-                "npu_us": k_us, "npu_GB_s": k_gbs, "npu_GFLOPS": k_gflops,
-                "speedup": speedup,
-            })
+            rows.append(
+                {
+                    "K": K,
+                    "L": L,
+                    "torch_us": t_us,
+                    "torch_GB_s": t_gbs,
+                    "torch_GFLOPS": t_gflops,
+                    "npu_us": k_us,
+                    "npu_GB_s": k_gbs,
+                    "npu_GFLOPS": k_gflops,
+                    "speedup": speedup,
+                }
+            )
     return rows
 
 
 # --- batched-vs-serial bench -----------------------------------------------
 
+
 def run_batched_vs_serial(sinq_func, stream_ptr, device):
     print(f"\nK={BATCH_K}, L={BATCH_L}, order={SINKHORN_ORDER}")
-    print(f"{'N':>5}  {'batched us':>12}  {'per-mat us':>12}  "
-          f"{'serial us':>12}  {'per-mat us':>12}  {'speedup':>8}")
+    print(
+        f"{'N':>5}  {'batched us':>12}  {'per-mat us':>12}  "
+        f"{'serial us':>12}  {'per-mat us':>12}  {'speedup':>8}"
+    )
     rows = []
     for N in BATCH_SIZES:
         mat = torch.rand(N, BATCH_K, BATCH_L, dtype=torch.float16, device=device) + 0.1
@@ -157,42 +185,65 @@ def run_batched_vs_serial(sinq_func, stream_ptr, device):
         mu1 = torch.empty(N, BATCH_L, dtype=torch.float16, device=device)
         mu2 = torch.empty(N, BATCH_K, dtype=torch.float16, device=device)
 
-        b_us = time_npu(lambda: sinq_func(
-            mat, out, mu1, mu2,
-            order=SINKHORN_ORDER, lr=SINKHORN_LR, eps=SINKHORN_EPS,
-            stream_ptr=stream_ptr,
-        ))
+        b_us = time_npu(
+            lambda: sinq_func(
+                mat,
+                out,
+                mu1,
+                mu2,
+                order=SINKHORN_ORDER,
+                lr=SINKHORN_LR,
+                eps=SINKHORN_EPS,
+                stream_ptr=stream_ptr,
+            )
+        )
 
-        mats_1 = [(
-            torch.rand(1, BATCH_K, BATCH_L, dtype=torch.float16, device=device) + 0.1,
-            torch.empty(1, BATCH_K, BATCH_L, dtype=torch.float16, device=device),
-            torch.empty(1, BATCH_L, dtype=torch.float16, device=device),
-            torch.empty(1, BATCH_K, dtype=torch.float16, device=device),
-        ) for _ in range(N)]
+        mats_1 = [
+            (
+                torch.rand(1, BATCH_K, BATCH_L, dtype=torch.float16, device=device)
+                + 0.1,
+                torch.empty(1, BATCH_K, BATCH_L, dtype=torch.float16, device=device),
+                torch.empty(1, BATCH_L, dtype=torch.float16, device=device),
+                torch.empty(1, BATCH_K, dtype=torch.float16, device=device),
+            )
+            for _ in range(N)
+        ]
 
         def serial_fn():
             for m, o, m1, m2 in mats_1:
-                sinq_func(m, o, m1, m2,
-                           order=SINKHORN_ORDER, lr=SINKHORN_LR, eps=SINKHORN_EPS,
-                           stream_ptr=stream_ptr)
+                sinq_func(
+                    m,
+                    o,
+                    m1,
+                    m2,
+                    order=SINKHORN_ORDER,
+                    lr=SINKHORN_LR,
+                    eps=SINKHORN_EPS,
+                    stream_ptr=stream_ptr,
+                )
 
         s_us = time_npu(serial_fn)
         speedup = s_us / b_us if b_us > 0 else float("nan")
 
-        print(f"{N:>5d}  {b_us:>12.2f}  {b_us/N:>12.2f}  "
-              f"{s_us:>12.2f}  {s_us/N:>12.2f}  {speedup:>8.2f}x")
-        rows.append({
-            "N": N,
-            "batched_us": b_us,
-            "batched_per_mat_us": b_us / N,
-            "serial_us": s_us,
-            "serial_per_mat_us": s_us / N,
-            "speedup": speedup,
-        })
+        print(
+            f"{N:>5d}  {b_us:>12.2f}  {b_us/N:>12.2f}  "
+            f"{s_us:>12.2f}  {s_us/N:>12.2f}  {speedup:>8.2f}x"
+        )
+        rows.append(
+            {
+                "N": N,
+                "batched_us": b_us,
+                "batched_per_mat_us": b_us / N,
+                "serial_us": s_us,
+                "serial_per_mat_us": s_us / N,
+                "speedup": speedup,
+            }
+        )
     return rows
 
 
 # --- plots ------------------------------------------------------------------
+
 
 def _shape_labels(rows):
     return [f"{r['K']}x{r['L']}" for r in rows]
@@ -200,6 +251,7 @@ def _shape_labels(rows):
 
 def plot_speedup(rows, path):
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import numpy as np
@@ -211,8 +263,9 @@ def plot_speedup(rows, path):
         grid[i, j] = r["speedup"]
 
     fig, ax = plt.subplots(figsize=(7.5, 4.5))
-    im = ax.imshow(grid, aspect="auto", cmap="viridis",
-                   vmin=1.0, vmax=max(np.nanmax(grid), 1.0))
+    im = ax.imshow(
+        grid, aspect="auto", cmap="viridis", vmin=1.0, vmax=max(np.nanmax(grid), 1.0)
+    )
     ax.set_xticks(range(len(N_TOKENS)), [str(l) for l in N_TOKENS])
     ax.set_yticks(range(len(HEAD_DIMS)), [str(k) for k in HEAD_DIMS])
     ax.set_xlabel("n_tokens")
@@ -220,10 +273,15 @@ def plot_speedup(rows, path):
     ax.set_title(f"PTO NPU fp16 vs torch fp16 — speedup (x), order={SINKHORN_ORDER}")
     for i in range(grid.shape[0]):
         for j in range(grid.shape[1]):
-            ax.text(j, i, f"{grid[i, j]:.1f}x",
-                    ha="center", va="center",
-                    color="white" if grid[i, j] < grid.max() * 0.6 else "black",
-                    fontsize=10)
+            ax.text(
+                j,
+                i,
+                f"{grid[i, j]:.1f}x",
+                ha="center",
+                va="center",
+                color="white" if grid[i, j] < grid.max() * 0.6 else "black",
+                fontsize=10,
+            )
     fig.colorbar(im, ax=ax, label="speedup")
     fig.tight_layout()
     fig.savefig(path, dpi=130)
@@ -233,6 +291,7 @@ def plot_speedup(rows, path):
 
 def _grouped_bar(rows, torch_key, npu_key, ylabel, title, path):
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import numpy as np
@@ -260,6 +319,7 @@ def _grouped_bar(rows, torch_key, npu_key, ylabel, title, path):
 
 def plot_batched(rows, path):
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
@@ -307,17 +367,18 @@ def plot_batched(rows, path):
 
 # --- main -------------------------------------------------------------------
 
+
 def _parse_args():
     parser = argparse.ArgumentParser(
         description="Benchmark PTO Sinkhorn (head-shapes + batched sweep)."
     )
     parser.add_argument("--npu", type=str, default="npu:0")
-    parser.add_argument("--no-cache-stream", dest="cache_stream",
-                        action="store_false")
+    parser.add_argument("--no-cache-stream", dest="cache_stream", action="store_false")
     parser.add_argument("--warmup", type=int, default=KERNEL_WARMUP)
     parser.add_argument("--repeats", type=int, default=KERNEL_REPEATS)
-    parser.add_argument("--skip-batched", action="store_true",
-                        help="Skip the batched-vs-serial sweep.")
+    parser.add_argument(
+        "--skip-batched", action="store_true", help="Skip the batched-vs-serial sweep."
+    )
     parser.set_defaults(cache_stream=True)
     return parser.parse_args()
 
@@ -344,7 +405,9 @@ def main():
     print(f"Using device: {device}")
     print("Compiling kernel_sinkhorn.cpp ...")
     sinq_func = jit_compile(
-        str(base / "kernel_sinkhorn.cpp"), verbose=True, device=device,
+        str(base / "kernel_sinkhorn.cpp"),
+        verbose=True,
+        device=device,
     )
     stream_ptr = get_current_stream_ptr() if args.cache_stream else None
     if stream_ptr is not None:
@@ -361,13 +424,17 @@ def main():
 
     plot_speedup(hs_rows, plot_dir / "head_shapes_speedup.png")
     _grouped_bar(
-        hs_rows, "torch_GB_s", "npu_GB_s",
+        hs_rows,
+        "torch_GB_s",
+        "npu_GB_s",
         ylabel="effective bandwidth (GB/s)",
         title=f"Sinkhorn fp16 bandwidth — order={SINKHORN_ORDER}, batch=1",
         path=plot_dir / "head_shapes_bandwidth.png",
     )
     _grouped_bar(
-        hs_rows, "torch_GFLOPS", "npu_GFLOPS",
+        hs_rows,
+        "torch_GFLOPS",
+        "npu_GFLOPS",
         ylabel="effective GFLOPS",
         title=f"Sinkhorn fp16 compute throughput — order={SINKHORN_ORDER}, batch=1",
         path=plot_dir / "head_shapes_flops.png",

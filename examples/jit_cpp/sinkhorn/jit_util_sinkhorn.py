@@ -35,12 +35,12 @@ SINKHORN_ARGTYPES = [
     ctypes.c_uint32,  # K
     ctypes.c_uint32,  # L
     ctypes.c_uint32,  # order
-    ctypes.c_float,   # lr
-    ctypes.c_float,   # eps
-    ctypes.c_float,   # invK
-    ctypes.c_float,   # invL
-    ctypes.c_float,   # invK1
-    ctypes.c_float,   # invL1
+    ctypes.c_float,  # lr
+    ctypes.c_float,  # eps
+    ctypes.c_float,  # invK
+    ctypes.c_float,  # invL
+    ctypes.c_float,  # invK1
+    ctypes.c_float,  # invL1
 ]
 
 
@@ -66,12 +66,7 @@ def _validate_sinkhorn_io(matrix_in, matrix_out, mu1_out, mu2_out, K, L):
             raise TypeError(f"{name} must use torch.float16.")
         if not t.is_contiguous():
             raise ValueError(f"{name} must be contiguous.")
-    if not (
-        matrix_in.device
-        == matrix_out.device
-        == mu1_out.device
-        == mu2_out.device
-    ):
+    if not (matrix_in.device == matrix_out.device == mu1_out.device == mu2_out.device):
         raise ValueError("All tensors must be on the same device.")
     if K > MAX_DIM or L > MAX_DIM:
         raise ValueError(f"K and L must be <= {MAX_DIM}.")

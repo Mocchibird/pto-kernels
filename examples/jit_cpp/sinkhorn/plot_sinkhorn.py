@@ -9,6 +9,7 @@ Writes:
   outputs/plots/head_shapes_*.png
   outputs/plots/batched_vs_serial_*.png
 """
+
 import argparse
 import csv
 from pathlib import Path
@@ -40,6 +41,7 @@ def _shape_labels(rows):
 
 def plot_speedup(rows, path):
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import numpy as np
@@ -51,8 +53,9 @@ def plot_speedup(rows, path):
             grid[HEAD_DIMS.index(K), N_TOKENS.index(L)] = float(r["speedup"])
 
     fig, ax = plt.subplots(figsize=(7.5, 4.5))
-    im = ax.imshow(grid, aspect="auto", cmap="viridis",
-                   vmin=1.0, vmax=max(np.nanmax(grid), 1.0))
+    im = ax.imshow(
+        grid, aspect="auto", cmap="viridis", vmin=1.0, vmax=max(np.nanmax(grid), 1.0)
+    )
     ax.set_xticks(range(len(N_TOKENS)), [str(l) for l in N_TOKENS])
     ax.set_yticks(range(len(HEAD_DIMS)), [str(k) for k in HEAD_DIMS])
     ax.set_xlabel("n_tokens")
@@ -61,10 +64,15 @@ def plot_speedup(rows, path):
     for i in range(grid.shape[0]):
         for j in range(grid.shape[1]):
             if not np.isnan(grid[i, j]):
-                ax.text(j, i, f"{grid[i, j]:.1f}x",
-                        ha="center", va="center",
-                        color="white" if grid[i, j] < np.nanmax(grid) * 0.6 else "black",
-                        fontsize=10)
+                ax.text(
+                    j,
+                    i,
+                    f"{grid[i, j]:.1f}x",
+                    ha="center",
+                    va="center",
+                    color="white" if grid[i, j] < np.nanmax(grid) * 0.6 else "black",
+                    fontsize=10,
+                )
     fig.colorbar(im, ax=ax, label="speedup")
     fig.tight_layout()
     fig.savefig(path, dpi=130)
@@ -74,6 +82,7 @@ def plot_speedup(rows, path):
 
 def grouped_bar(rows, key_a, key_b, label_a, label_b, ylabel, title, path):
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import numpy as np
@@ -101,6 +110,7 @@ def grouped_bar(rows, key_a, key_b, label_a, label_b, ylabel, title, path):
 
 def plot_batched(rows, path):
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
@@ -162,13 +172,21 @@ def main():
         rows = _load_csv(hs_csv)
         plot_speedup(rows, plot_dir / "head_shapes_speedup.png")
         grouped_bar(
-            rows, "torch_GB_s", "npu_GB_s", "torch fp16", "PTO NPU fp16",
+            rows,
+            "torch_GB_s",
+            "npu_GB_s",
+            "torch fp16",
+            "PTO NPU fp16",
             ylabel="effective bandwidth (GB/s)",
             title=f"Sinkhorn fp16 bandwidth — order={SINKHORN_ORDER}, batch=1",
             path=plot_dir / "head_shapes_bandwidth.png",
         )
         grouped_bar(
-            rows, "torch_GFLOPS", "npu_GFLOPS", "torch fp16", "PTO NPU fp16",
+            rows,
+            "torch_GFLOPS",
+            "npu_GFLOPS",
+            "torch fp16",
+            "PTO NPU fp16",
             ylabel="effective GFLOPS",
             title=f"Sinkhorn fp16 compute throughput — order={SINKHORN_ORDER}, batch=1",
             path=plot_dir / "head_shapes_flops.png",
