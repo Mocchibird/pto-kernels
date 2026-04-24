@@ -81,16 +81,58 @@ def _compile_kernel() -> ctypes.CDLL:
     return lib
 
 
-_lib = None  # populated on first call
+# Module-global cache populated on first call.
+#
+# Stream caching gotcha (learned the hard way on 2026-04-24):
+#   Caching only the raw pointer (_as_parameter_) and skipping any Python-
+#   level stream interaction on hot calls causes PyTorch's caching allocator
+#   to reuse the output tensor's memory prematurely — the kernel's writes
+#   land in memory the allocator has already handed back out, producing
+#   stray NaNs in later outputs.
+#
+#   The fix: keep the Stream *object* alive, and on every launch touch
+#   `_stream_obj.npu_stream` (~0.6us, plain attribute access on a Python
+#   int).  That touch carries whatever bookkeeping side effect the allocator
+#   relies on; the native pointer it returns is identical to the cached
+#   `_as_parameter_.value`, so we can pass it straight to ctypes.
+#   Previously we called `torch.npu.current_stream()` per launch (~27us) —
+#   46× more expensive for the same correctness guarantee.
+_lib = None
+_kernel = None
+_block_dim = None
+_stream_obj = None  # cached Stream object — keep alive for native-handle validity
+
+
+def _ensure_ready() -> None:
+    global _lib, _kernel, _block_dim, _stream_obj
+    if _lib is not None:
+        return
+    _lib = _compile_kernel()
+    _kernel = _lib.call_sinkhorn
+    _block_dim = torch.npu.get_device_properties("npu:0").cube_core_num
+    _stream_obj = torch.npu.current_stream()
+
+
+def _current_stream_ptr():
+    # Attribute access on the cached Stream object; returns an int equal to
+    # _as_parameter_.value.  ctypes auto-converts int → c_void_p.
+    return _stream_obj.npu_stream
+
+
+def launch_v1_raw(in_ptr: ctypes.c_void_p, out_ptr: ctypes.c_void_p,
+                  n_matrices: int, repeat: int, eps: float) -> None:
+    """Low-overhead launch path.  Takes pre-built ctypes pointers so no
+    `ctypes.c_void_p(tensor.data_ptr())` cost on the hot path."""
+    _ensure_ready()
+    _kernel(_block_dim, _current_stream_ptr(), in_ptr, out_ptr,
+            n_matrices, repeat, eps)
 
 
 def _run_kernel(x: torch.Tensor, out: torch.Tensor, repeat: int, eps: float) -> None:
-    global _lib
-    if _lib is None:
-        _lib = _compile_kernel()
-    _lib.call_sinkhorn(
-        torch.npu.get_device_properties("npu:0").cube_core_num,
-        torch.npu.current_stream()._as_parameter_,
+    _ensure_ready()
+    _kernel(
+        _block_dim,
+        _current_stream_ptr(),
         ctypes.c_void_p(x.data_ptr()),
         ctypes.c_void_p(out.data_ptr()),
         x.numel() // (4 * 4),     # number of 4×4 matrices
