@@ -138,9 +138,15 @@ __global__ AICORE void fast_hadamard_a5(__gm__ void *x_gm, uint32_t batch)
     const unsigned x_off[2] = {UB_X0, UB_X1};
     const event_t ev[2] = {EVENT_ID0, EVENT_ID1};
 
+    // On A5, get_block_idx()/get_block_num() already enumerate all vector
+    // subblocks (AIVs): a block_dim=8 launch yields block ids 0..15, and the two
+    // AIVs of one AIC receive distinct ids (confirmed in sim — AIC0's subblocks
+    // took tiles 0 and 1). So, unlike the dav-c220 standard kernel, we do NOT
+    // combine get_subblockid()/get_subblockdim() here; doing so would double-count
+    // and make cores redundantly reprocess tiles. Each id owns a disjoint tile set.
     const uint32_t cid = get_block_idx();
     const uint32_t num_cores = get_block_num();
-    const uint32_t tiles = batch / ROWS_PER_TILE;
+    const uint32_t tiles = batch / ROWS_PER_TILE;   // batch MUST be a multiple of ROWS_PER_TILE
 
     set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
     set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);

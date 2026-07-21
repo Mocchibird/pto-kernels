@@ -25,8 +25,11 @@ def _ascend_home() -> str:
 
 
 def compile_kernel(n: int = 128, src: Path | None = None, out_dir: Path | None = None,
-                   verbose: bool = True) -> Path:
-    """Compile fast_hadamard_a5.cpp to a device .so for the given block size N."""
+                   verbose: bool = True, force: bool = False) -> Path:
+    """Compile fast_hadamard_a5.cpp to a device .so for the given block size N.
+
+    Skips the bisheng invocation when an up-to-date .so already exists (pass
+    force=True to always rebuild)."""
     src = Path(src) if src else HERE / "fast_hadamard_a5.cpp"
     out_dir = Path(out_dir) if out_dir else HERE / "build"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -37,6 +40,10 @@ def compile_kernel(n: int = 128, src: Path | None = None, out_dir: Path | None =
     inv = repr(1.0 / math.sqrt(n))
     obj = out_dir / f"fht_a5_n{n}.o"
     so = out_dir / f"fht_a5_n{n}.so"
+    if not force and so.exists() and so.stat().st_mtime >= src.stat().st_mtime:
+        if verbose:
+            print(f"[compile] up-to-date, reusing {so}")
+        return so
     common = [
         "--cce-aicore-arch=dav-c310-vec", "-DREGISTER_BASE",
         f"-DHAD_N={n}", f"-DHAD_LOG2N={log2n}", f"-DHAD_INV_SQRT={inv}f",
@@ -74,7 +81,12 @@ def load_lib(so_path: Path, block_dim: int = 20):
             return stream_ptr
         import torch  # noqa
         s = torch.npu.current_stream()
-        return getattr(s, "_as_parameter_", None)
+        ptr = getattr(s, "_as_parameter_", None)
+        if ptr is None:
+            raise RuntimeError(
+                "Could not resolve the current NPU stream pointer; the kernel "
+                "would launch on the default stream and Event timing would be wrong.")
+        return ptr
 
     def hadamard_func(x, batch, n=None, log2_n=None, block_dim=block_dim, stream_ptr=None):
         kernel(int(block_dim), _stream_ptr(stream_ptr),

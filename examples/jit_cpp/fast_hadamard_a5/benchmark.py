@@ -20,6 +20,11 @@ import numpy as np
 
 N = 128
 BYTES_PER_ELEM = 2  # fp16
+# Must match the kernel's compiled ROWS_PER_TILE (default 16). The kernel
+# processes floor(batch / ROWS_PER_TILE) tiles; a batch that is not a multiple
+# leaves the tail rows untransformed, so reject it rather than report a
+# bandwidth for a partial transform.
+ROWS_PER_TILE = 16
 
 
 def sylvester(n):
@@ -53,18 +58,21 @@ def check_correctness(hadamard_func, torch, batch=256, seed=0):
 
 
 def time_us(hadamard_func, torch, batch, block_dim, warmup, repeats):
-    # in-place kernel: use independent buffers so each timed launch sees fresh data
-    pool = [torch.randn(batch, N, dtype=torch.float16).npu()
-            for _ in range(warmup + repeats)]
+    # In-place kernel, so each launch mutates its buffer. The transform is
+    # orthonormal (H/sqrt(N)), so repeated application is norm-preserving and
+    # stays in fp16 range -> a small round-robin pool is safe and bounds device
+    # memory to POOL buffers regardless of `repeats`.
+    POOL = min(warmup + repeats, 8)
+    pool = [torch.randn(batch, N, dtype=torch.float16).npu() for _ in range(POOL)]
     torch.npu.synchronize()
     for i in range(warmup):
-        hadamard_func(pool[i], batch, block_dim=block_dim)
+        hadamard_func(pool[i % POOL], batch, block_dim=block_dim)
     torch.npu.synchronize()
     start = torch.npu.Event(enable_timing=True)
     end = torch.npu.Event(enable_timing=True)
     start.record()
     for i in range(repeats):
-        hadamard_func(pool[warmup + i], batch, block_dim=block_dim)
+        hadamard_func(pool[i % POOL], batch, block_dim=block_dim)
     end.record()
     torch.npu.synchronize()
     return start.elapsed_time(end) * 1e3 / repeats  # ms/rep -> us/rep
@@ -93,6 +101,12 @@ def main():
         sys.exit(1)
 
     batches = [int(b) for b in args.batches.split(",") if b]
+    bad = [b for b in batches if b % ROWS_PER_TILE != 0]
+    if bad:
+        print(f"error: batches {bad} are not multiples of ROWS_PER_TILE="
+              f"{ROWS_PER_TILE}; the kernel would leave tail rows untransformed.",
+              file=sys.stderr)
+        sys.exit(1)
     rows = []
     hdr = f"{'batch':>8}  {'N':>4}  {'dur_us':>10}  {'GB/s':>9}  {'TB/s':>7}"
     print("\n" + hdr + "\n" + "-" * len(hdr))

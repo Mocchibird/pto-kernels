@@ -66,12 +66,11 @@ def test_interleave_recombine_is_not_a_hadamard():
 def test_on_device_matches_reference():
     import torch  # noqa
     import torch_npu  # noqa
-    from jit_util_hadamard_a5 import jit_compile
+    from jit_util_hadamard_a5 import build_and_load
 
-    here = os.path.dirname(__file__)
-    fn = jit_compile(os.path.join(here, "fast_hadamard_a5.cpp"))
+    fn = build_and_load(N)
 
-    batch = 256
+    batch = 256  # multiple of the kernel's ROWS_PER_TILE (16)
     inv = 1.0 / np.sqrt(N)
     H = sylvester(N)
     x_np = np.random.default_rng(2).standard_normal((batch, N)).astype(np.float16)
