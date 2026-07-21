@@ -1,66 +1,88 @@
-"""JIT loader for the register-resident fast_hadamard_a5 kernel.
+"""Self-contained build + load for fast_hadamard_a5 on an Ascend 950 (A5) device.
 
-Mirrors examples/jit_cpp/fast_hadamard/standard/jit_util_hadamard.py. The kernel
-is in-place fp16 over (batch, N) with N == 128 (see README for scope).
+Deliberately standalone: the shared examples/jit_cpp jit_util_common.compile_cpp
+targets dav-c220 (-DMEMORY_BASE), but this kernel is A5 (dav-c310-vec,
+-DREGISTER_BASE), so we compile with bisheng directly here. Only needs a working
+`bisheng` (set ASCEND_HOME_PATH / ASCEND_TOOLKIT_HOME) to build, and torch_npu
+at run time to launch.
 """
 
 import ctypes
+import math
+import os
+import subprocess
+from pathlib import Path
 
-from jit_util_common import (
-    BLOCK_DIM,
-    DEFAULT_DEVICE,
-    jit_compile_with_loader,
-    load_cdll,
-    load_required_symbol,
-    resolve_launch_block_dim,
-    resolve_stream_ptr,
-    torch_to_ctypes,
-)
+HERE = Path(__file__).resolve().parent
 
 
-def load_lib(lib_path, block_dim=BLOCK_DIM):
-    lib = load_cdll(lib_path)
-    resolved_block_dim = max(1, int(block_dim))
+def _ascend_home() -> str:
+    for k in ("ASCEND_HOME_PATH", "ASCEND_TOOLKIT_HOME"):
+        v = os.environ.get(k)
+        if v:
+            return v
+    raise RuntimeError("set ASCEND_HOME_PATH or ASCEND_TOOLKIT_HOME")
 
-    kernel = load_required_symbol(
-        lib,
-        "call_fast_hadamard_a5",
-        [
-            ctypes.c_uint32,   # block_dim
-            ctypes.c_void_p,   # stream
-            ctypes.c_void_p,   # x (in-place, fp16)
-            ctypes.c_uint32,   # batch (number of length-N rows)
-        ],
-    )
 
-    def hadamard_func(x, batch, block_dim=resolved_block_dim, stream_ptr=None):
-        kernel(
-            resolve_launch_block_dim(block_dim, resolved_block_dim),
-            resolve_stream_ptr(stream_ptr),
-            torch_to_ctypes(x),
-            batch,
-        )
+def compile_kernel(n: int = 128, src: Path | None = None, out_dir: Path | None = None,
+                   verbose: bool = True) -> Path:
+    """Compile fast_hadamard_a5.cpp to a device .so for the given block size N."""
+    src = Path(src) if src else HERE / "fast_hadamard_a5.cpp"
+    out_dir = Path(out_dir) if out_dir else HERE / "build"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    home = _ascend_home()
+    bisheng = f"{home}/bin/bisheng"
+    inc = f"{home}/aarch64-linux/include"
+    log2n = n.bit_length() - 1
+    inv = repr(1.0 / math.sqrt(n))
+    obj = out_dir / f"fht_a5_n{n}.o"
+    so = out_dir / f"fht_a5_n{n}.so"
+    common = [
+        "--cce-aicore-arch=dav-c310-vec", "-DREGISTER_BASE",
+        f"-DHAD_N={n}", f"-DHAD_LOG2N={log2n}", f"-DHAD_INV_SQRT={inv}f",
+        "-O2", "-std=c++17", "-fPIC",
+        "-Wno-ignored-attributes", "-Wno-macro-redefined",
+        "-mllvm", "-cce-aicore-stack-size=0x8000",
+        "-mllvm", "-cce-aicore-function-stack-size=0x8000",
+        "-mllvm", "-cce-aicore-addr-transform",
+        "-mllvm", "-cce-aicore-dcci-insert-for-scalar=false",
+        "-Xhost-start", "-Xhost-end", f"-I{inc}", f"-I{home}/include",
+    ]
+    cc = [bisheng, "-xcce", *common, "-c", str(src), "-o", str(obj)]
+    ln = [bisheng, "-fPIC", "-shared", "--cce-fatobj-link",
+          f"-Wl,-soname,{so.name}", str(obj), "-o", str(so)]
+    if verbose:
+        print(f"[compile] N={n} log2={log2n} -> {so}")
+    subprocess.run(cc, check=True)
+    subprocess.run(ln, check=True)
+    return so
 
-    hadamard_func.block_dim = resolved_block_dim
+
+def load_lib(so_path: Path, block_dim: int = 20):
+    """ctypes-load the .so and return a launch callable.
+
+    The returned func signature is (x, batch, n, log2_n, block_dim, stream_ptr)
+    to be drop-in compatible with the repo's run_hadamard_iteration; n / log2_n
+    are ignored (compiled into the kernel)."""
+    lib = ctypes.CDLL(str(so_path))
+    kernel = lib.call_fast_hadamard_a5
+    kernel.argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
+    kernel.restype = None
+
+    def _stream_ptr(stream_ptr):
+        if stream_ptr is not None:
+            return stream_ptr
+        import torch  # noqa
+        s = torch.npu.current_stream()
+        return getattr(s, "_as_parameter_", None)
+
+    def hadamard_func(x, batch, n=None, log2_n=None, block_dim=block_dim, stream_ptr=None):
+        kernel(int(block_dim), _stream_ptr(stream_ptr),
+               ctypes.c_void_p(x.data_ptr()), int(batch))
+
+    hadamard_func.block_dim = block_dim
     return hadamard_func
 
 
-def jit_compile(
-    src_path,
-    verbose=True,
-    clean_up=False,
-    so_dir=None,
-    device: str | int = DEFAULT_DEVICE,
-):
-    # NOTE: N is a compile-time macro (single-register butterfly). This wrapper
-    # compiles with the kernel's built-in default (HAD_N=128). To build another
-    # supported N, pass -DHAD_N/-DHAD_LOG2N via the standalone sim_test/run.sh,
-    # which is also the authoritative on-device correctness check.
-    return jit_compile_with_loader(
-        src_path,
-        load_lib,
-        verbose=verbose,
-        clean_up=clean_up,
-        so_dir=so_dir,
-        device=device,
-    )
+def build_and_load(n: int = 128, block_dim: int = 20, verbose: bool = True):
+    return load_lib(compile_kernel(n, verbose=verbose), block_dim=block_dim)

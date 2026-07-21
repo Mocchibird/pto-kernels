@@ -112,9 +112,40 @@ Runs on the `Ascend950PR_9599` camodel and checks the fp16 output against a CPU
 natural-order Sylvester WHT. Current result: N=128, batch=256 → `max_diff ≈
 1.9e-3` (fp16 rounding), `err_count = 0/32768`, `PASS`.
 
+## Benchmark on a 950 device (real hardware)
+
+On an actual Ascend 950 server (with `torch` + `torch_npu` and the CANN
+toolkit), one command compiles, correctness-checks, and benchmarks — reporting
+achieved HBM bandwidth:
+
+```bash
+export ASCEND_HOME_PATH=${ASCEND_TOOLKIT_HOME}
+cd examples/jit_cpp/fast_hadamard_a5
+./run_benchmark.sh --npu 0 --block-dim 20
+# sweep sizes + write CSV:
+./run_benchmark.sh --npu 0 --block-dim 20 \
+    --batches 1024,4096,16384,65536 --repeats 50 --csv bw.csv
+```
+
+Output per size: `duration_us`, `GB/s`, `TB/s`, where bandwidth = `2·batch·N·2 B`
+(load + store) ÷ measured time (`torch.npu.Event`). It first verifies the output
+against the natural Sylvester WHT and aborts if that fails.
+
+- **`--block-dim`** is the launch grid = number of AIC on your 950 (each spawns
+  2 AIV); set it to the device's AIC count for full occupancy. The kernel is
+  correct for any value.
+- This is **self-contained**: it compiles with the A5 toolchain directly
+  (`dav-c310-vec`, `-DREGISTER_BASE`) rather than the shared `jit_util_common`,
+  which targets `dav-c220`.
+- Unlike the camodel (which models compute only, not HBM), a real 950 exposes
+  the memory-bound behavior — this is where the ">3 TB/s / ≈copy-speed" claim
+  is actually measurable.
+
 ## Files
 
 - `fast_hadamard_a5.cpp` — the kernel (register-resident butterfly + ping/pong DMA).
 - `sim_test/main.cpp`, `sim_test/run.sh` — self-contained on-device correctness test.
-- `jit_util_hadamard_a5.py` — Python JIT loader mirroring `../fast_hadamard/standard`.
-- `test_hadamard_a5.py` — numpy/scipy reference check (host-side transform math).
+- `benchmark.py` — on-device benchmark: compile + correctness + bandwidth (real 950).
+- `run_benchmark.sh` — one-command wrapper (sets env, runs `benchmark.py`).
+- `jit_util_hadamard_a5.py` — self-contained A5 build (`compile_kernel`) + ctypes loader.
+- `test_hadamard_a5.py` — numpy reference check (host-side transform math).
