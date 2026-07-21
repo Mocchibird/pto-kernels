@@ -1,0 +1,8 @@
+build/
+build_*/
+camodel_log/
+*.o
+*.so
+fht_a5_test
+__pycache__/
+*.csv
