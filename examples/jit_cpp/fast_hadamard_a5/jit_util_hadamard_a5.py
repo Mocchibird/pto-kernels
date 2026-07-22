@@ -65,14 +65,15 @@ def compile_kernel(n: int = 128, src: Path | None = None, out_dir: Path | None =
     return so
 
 
-def load_lib(so_path: Path, block_dim: int = 20):
-    """ctypes-load the .so and return a launch callable.
+def load_lib(so_path: Path, block_dim: int = 20, symbol: str = "call_fast_hadamard_a5"):
+    """ctypes-load the .so and return a launch callable for `symbol`.
 
     The returned func signature is (x, batch, n, log2_n, block_dim, stream_ptr)
     to be drop-in compatible with the repo's run_hadamard_iteration; n / log2_n
-    are ignored (compiled into the kernel)."""
+    are ignored (compiled into the kernel). `symbol` selects the kernel entry,
+    e.g. "call_copy_ref_a5" for the DMA copy-floor."""
     lib = ctypes.CDLL(str(so_path))
-    kernel = lib.call_fast_hadamard_a5
+    kernel = getattr(lib, symbol)
     kernel.argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
     kernel.restype = None
 

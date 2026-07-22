@@ -87,14 +87,19 @@ def main():
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--repeats", type=int, default=50)
     ap.add_argument("--csv", default=None)
+    ap.add_argument("--copy-floor", action="store_true",
+                    help="also time the pure GM->UB->GM copy (DMA ceiling) and report Hadamard/copy.")
     args = ap.parse_args()
 
     import torch
     import torch_npu  # noqa
-    from jit_util_hadamard_a5 import build_and_load
+    from jit_util_hadamard_a5 import compile_kernel, load_lib
 
     torch.npu.set_device(int(str(args.npu).split(":")[-1]))
-    fn = build_and_load(N, block_dim=args.block_dim)
+    so = compile_kernel(N)
+    fn = load_lib(so, block_dim=args.block_dim)
+    copy_fn = load_lib(so, block_dim=args.block_dim,
+                       symbol="call_copy_ref_a5") if args.copy_floor else None
 
     if not check_correctness(fn, torch):
         print("Correctness failed; aborting benchmark.", file=sys.stderr)
@@ -109,15 +114,25 @@ def main():
         sys.exit(1)
     rows = []
     hdr = f"{'batch':>8}  {'N':>4}  {'dur_us':>10}  {'GB/s':>9}  {'TB/s':>7}"
+    if copy_fn:
+        hdr += f"  {'copy_GB/s':>10}  {'had/copy':>9}"
     print("\n" + hdr + "\n" + "-" * len(hdr))
     for batch in batches:
         us = time_us(fn, torch, batch, args.block_dim, args.warmup, args.repeats)
         data_bytes = 2 * batch * N * BYTES_PER_ELEM  # load + store
         gbs = (data_bytes / 1e9) / (us / 1e6)
-        print(f"{batch:>8}  {N:>4}  {us:>10.3f}  {gbs:>9.1f}  {gbs / 1000:>7.3f}")
-        rows.append({"batch": batch, "N": N, "block_dim": args.block_dim,
-                     "duration_us": round(us, 4), "bytes": data_bytes,
-                     "bandwidth_gbs": round(gbs, 2)})
+        rec = {"batch": batch, "N": N, "block_dim": args.block_dim,
+               "duration_us": round(us, 4), "bytes": data_bytes,
+               "bandwidth_gbs": round(gbs, 2)}
+        line = f"{batch:>8}  {N:>4}  {us:>10.3f}  {gbs:>9.1f}  {gbs / 1000:>7.3f}"
+        if copy_fn:
+            cus = time_us(copy_fn, torch, batch, args.block_dim, args.warmup, args.repeats)
+            cgbs = (data_bytes / 1e9) / (cus / 1e6)
+            rec["copy_gbs"] = round(cgbs, 2)
+            rec["hadamard_over_copy"] = round(gbs / cgbs, 3) if cgbs else 0.0
+            line += f"  {cgbs:>10.1f}  {rec['hadamard_over_copy']:>9.3f}"
+        print(line)
+        rows.append(rec)
 
     if args.csv:
         with open(args.csv, "w", newline="") as f:

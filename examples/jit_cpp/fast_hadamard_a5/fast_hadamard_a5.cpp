@@ -43,13 +43,18 @@ using namespace pto;
 #ifndef HAD_LOG2N
 #define HAD_LOG2N 7
 #endif
-// Rows (length-N blocks) processed per GM<->UB tile. Must be a multiple of
-// (128 / HAD_N) so each register is fully packed. Kept small by default so a
-// typical batch produces >=16 tiles and fills all 16 AIV (the A5 has 8 AIC x 2
-// vector subblocks); the msprof grid-fill trap is under-tiling, not the kernel.
+// Rows (length-N blocks) per GM<->UB tile. Sized for a large DMA burst: at
+// N=128 this is a ROWS_PER_TILE*256 B contiguous transfer (256 rows = 64 KB),
+// which the HBM path can drive near peak. Ping/pong uses 2 buffers, so
+// 2*ROWS_PER_TILE*256 B must fit the UB budget below. For a given batch, pick
+// ROWS_PER_TILE so batch/ROWS_PER_TILE >= (# AIV) to still fill the grid.
 #ifndef ROWS_PER_TILE
-#define ROWS_PER_TILE 16
+#define ROWS_PER_TILE 256
 #endif
+// Software-pipeline width. The butterfly body is manually unrolled 4-way
+// (see hadamard_vf) to hide the vdintlv->vadd->vsub->vsel dependency-chain
+// latency across independent registers; REGS_PER_TILE must be a multiple of 4.
+#define HAD_UNROLL 4
 
 static_assert(HAD_N >= 2 && HAD_N <= 128, "register kernel supports N in [2,128]");
 static_assert((HAD_N & (HAD_N - 1)) == 0, "HAD_N must be a power of two");
@@ -65,6 +70,8 @@ constexpr unsigned BLK_PER_REG = LANES_B16 / HAD_N;
 static_assert(ROWS_PER_TILE % BLK_PER_REG == 0,
               "ROWS_PER_TILE must be a multiple of 128/HAD_N");
 constexpr unsigned REGS_PER_TILE = ROWS_PER_TILE / BLK_PER_REG;
+static_assert(REGS_PER_TILE % HAD_UNROLL == 0,
+              "REGS_PER_TILE must be a multiple of HAD_UNROLL");
 constexpr unsigned FLAT = ROWS_PER_TILE * HAD_N; // = REGS_PER_TILE * 128
 
 constexpr unsigned aln256(unsigned b) { return (b + 255u) & ~255u; }
@@ -106,17 +113,35 @@ __tf__ static AICORE void hadamard_vf(__ubuf__ half *x)
         MaskReg mlo = CreatePredicate<half>(lh);         // lanes 0..63 active
         const half inv = (half)HAD_INV_SQRT;
 
-        for (uint16_t r = 0; r < (uint16_t)REGS_PER_TILE; ++r) {
-            RegTensor<half> v, e, o, s, d;
-            vlds(v, x, r * LANES_B16, NORM);
+        // 4-way software pipeline: issue the SAME op for 4 independent
+        // registers back-to-back so the vector pipe stays busy through each
+        // op's latency instead of stalling on the vdintlv->vadd->vsub->vsel
+        // dependency chain of a single register. Explicit (not array/loop)
+        // because __VEC_SCOPE__ requires individually-named RegTensors.
+        for (uint16_t base = 0; base < (uint16_t)REGS_PER_TILE; base += 4) {
+            RegTensor<half> v0, v1, v2, v3, e0, e1, e2, e3, o0, o1, o2, o3,
+                            s0, s1, s2, s3, d0, d1, d2, d3;
+            const uint32_t b = base * LANES_B16;
+            vlds(v0, x, b + 0 * LANES_B16, NORM);
+            vlds(v1, x, b + 1 * LANES_B16, NORM);
+            vlds(v2, x, b + 2 * LANES_B16, NORM);
+            vlds(v3, x, b + 3 * LANES_B16, NORM);
             for (uint16_t st = 0; st < (uint16_t)HAD_LOG2N; ++st) {
-                vdintlv(e, o, v, v);       // e=[evens|evens], o=[odds|odds]
-                vadd(s, e, o, p);          // s=[sums|sums]
-                vsub(d, e, o, p);          // d=[diffs|diffs]
-                vsel(v, s, d, mlo);        // v=[sums(0..63) | diffs(64..127)] concat-halves
+                vdintlv(e0, o0, v0, v0); vdintlv(e1, o1, v1, v1);
+                vdintlv(e2, o2, v2, v2); vdintlv(e3, o3, v3, v3);
+                vadd(s0, e0, o0, p); vadd(s1, e1, o1, p);
+                vadd(s2, e2, o2, p); vadd(s3, e3, o3, p);
+                vsub(d0, e0, o0, p); vsub(d1, e1, o1, p);
+                vsub(d2, e2, o2, p); vsub(d3, e3, o3, p);
+                vsel(v0, s0, d0, mlo); vsel(v1, s1, d1, mlo);
+                vsel(v2, s2, d2, mlo); vsel(v3, s3, d3, mlo);
             }
-            vmuls(v, v, inv, p, MODE_ZEROING);   // 1/sqrt(N) orthonormal scale
-            vsts(v, x, r * LANES_B16, NORM_B16, p);
+            vmuls(v0, v0, inv, p, MODE_ZEROING); vmuls(v1, v1, inv, p, MODE_ZEROING);
+            vmuls(v2, v2, inv, p, MODE_ZEROING); vmuls(v3, v3, inv, p, MODE_ZEROING);
+            vsts(v0, x, b + 0 * LANES_B16, NORM_B16, p);
+            vsts(v1, x, b + 1 * LANES_B16, NORM_B16, p);
+            vsts(v2, x, b + 2 * LANES_B16, NORM_B16, p);
+            vsts(v3, x, b + 3 * LANES_B16, NORM_B16, p);
         }
     }
 }
@@ -182,4 +207,49 @@ extern "C" void call_fast_hadamard_a5(uint32_t block_dim, void *stream,
                                       uint8_t *x, uint32_t batch)
 {
     fast_hadamard_a5<<<block_dim, nullptr, stream>>>(x, batch);
+}
+
+// Copy-floor reference: identical tiling / ping-pong GM->UB->GM bounce with NO
+// compute. Times the DMA path alone so a benchmark can attribute the Hadamard's
+// bandwidth gap to memory vs compute. Same FLAT tile and double-buffering.
+__global__ AICORE void copy_ref_a5(__gm__ void *x_gm, uint32_t batch)
+{
+#ifdef __DAV_VEC__
+    using Sh = pto::Shape<1, 1, 1, 1, FLAT>;
+    using St = pto::Stride<1, 1, 1, FLAT, 1>;
+    using FlatTile = Tile<TileType::Vec, half, 1, FLAT, BLayout::RowMajor, 1, FLAT>;
+
+    const unsigned x_off[2] = {UB_X0, UB_X1};
+    const event_t ev[2] = {EVENT_ID0, EVENT_ID1};
+    const uint32_t cid = get_block_idx();
+    const uint32_t num_cores = get_block_num();
+    const uint32_t tiles = batch / ROWS_PER_TILE;
+
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+
+    uint32_t it = 0;
+    for (uint32_t tb = cid; tb < tiles; tb += num_cores, ++it) {
+        const int pp = it & 1;
+        const uint64_t off = static_cast<uint64_t>(tb) * FLAT;
+        GlobalTensor<half, Sh, St> g(reinterpret_cast<__gm__ half *>(x_gm) + off, Sh());
+        wait_flag(PIPE_MTE3, PIPE_MTE2, ev[pp]);
+        FlatTile xt;  TASSIGN(xt, x_off[pp]);
+        TLOAD(xt, g);
+        set_flag(PIPE_MTE2, PIPE_MTE3, ev[pp]);
+        wait_flag(PIPE_MTE2, PIPE_MTE3, ev[pp]);
+        TSTORE(g, xt);
+        set_flag(PIPE_MTE3, PIPE_MTE2, ev[pp]);
+    }
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+#else
+    (void)x_gm; (void)batch;
+#endif
+}
+
+extern "C" void call_copy_ref_a5(uint32_t block_dim, void *stream,
+                                 uint8_t *x, uint32_t batch)
+{
+    copy_ref_a5<<<block_dim, nullptr, stream>>>(x, batch);
 }

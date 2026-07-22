@@ -131,6 +131,28 @@ Output per size: `duration_us`, `GB/s`, `TB/s`, where bandwidth = `2·batch·N·
 (load + store) ÷ measured time (`torch.npu.Event`). It first verifies the output
 against the natural Sylvester WHT and aborts if that fails.
 
+### Performance tuning (approaching HBM bandwidth)
+
+Two levers matter for utilization; both are in the kernel now:
+
+- **Tile size** (`ROWS_PER_TILE`, default 256 → a 64 KB DMA burst). Small tiles
+  (the earlier 16 → 4 KB) leave the HBM path idle and pay per-tile sync
+  overhead. Larger tiles drive bigger contiguous bursts. Trade-off: for a given
+  batch, keep `batch / ROWS_PER_TILE >= (#AIV)` so the grid still fills.
+- **Register software-pipelining** (`hadamard_vf` is unrolled 4-way). The
+  butterfly is a `vdintlv→vadd→vsub→vsel` dependency chain; issuing each op for
+  4 independent registers back-to-back hides the per-op latency instead of
+  stalling on it.
+
+Use `--copy-floor` to measure the pure GM→UB→GM DMA ceiling (same tiling) and
+print `had/copy` — the fraction of copy speed the transform achieves. If
+`had/copy` is near 1.0 the kernel is memory-bound (done); if it's low, compute
+(the butterfly) is still the limit.
+
+```bash
+./run_benchmark.sh --npu 0 --block-dim 32 --batches 16384,65536 --copy-floor
+```
+
 - **`--block-dim`** is the launch grid = number of AIC on your 950 (each spawns
   2 AIV); set it to the device's AIC count for full occupancy. The kernel is
   correct for any value.
