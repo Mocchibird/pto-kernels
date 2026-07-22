@@ -111,25 +111,19 @@ __tf__ static AICORE void hadamard_vf(__ubuf__ half *x)
         MaskReg p = CreatePredicate<half>(l);            // all 128 b16 lanes
         uint32_t lh = LANES_B16 / 2;
         MaskReg mlo = CreatePredicate<half>(lh);         // lanes 0..63 active
-        MaskReg mhi;
-        pnot(mhi, mlo, p);                               // lanes 64..127 active
         const half inv = (half)HAD_INV_SQRT;
 
         // 8-way software pipeline: issue the SAME op for HAD_UNROLL independent
-        // registers back-to-back so the vector pipe stays busy through each op's
-        // latency. Explicit (not array/loop) because __VEC_SCOPE__ requires
-        // individually-named RegTensors.
-        //
-        // Per stage = 3 ops (was 4): vdintlv(v,v) duplicates evens/odds into
-        // both 64-lane halves, then a MERGE-mode vadd writes sums to the low
-        // half and a MERGE-mode vsub writes diffs to the high half in place.
-        // This replaces the earlier vadd+vsub+vsel (the vsel recombine is now
-        // free), cutting ~25% of the op count -- the bottleneck is op count,
-        // not memory (copy floor ~2.5 TB/s) or ILP latency.
+        // registers back-to-back so the vector pipe stays busy through each
+        // op's latency instead of stalling on the vdintlv->vadd->vsub->vsel
+        // dependency chain of a single register. Explicit (not array/loop)
+        // because __VEC_SCOPE__ requires individually-named RegTensors.
         for (uint16_t base = 0; base < (uint16_t)REGS_PER_TILE; base += 8) {
             RegTensor<half> v0, v1, v2, v3, v4, v5, v6, v7;
             RegTensor<half> e0, e1, e2, e3, e4, e5, e6, e7;
             RegTensor<half> o0, o1, o2, o3, o4, o5, o6, o7;
+            RegTensor<half> s0, s1, s2, s3, s4, s5, s6, s7;
+            RegTensor<half> d0, d1, d2, d3, d4, d5, d6, d7;
             const uint32_t b = base * LANES_B16;
             vlds(v0, x, b + 0 * LANES_B16, NORM); vlds(v1, x, b + 1 * LANES_B16, NORM);
             vlds(v2, x, b + 2 * LANES_B16, NORM); vlds(v3, x, b + 3 * LANES_B16, NORM);
@@ -140,16 +134,18 @@ __tf__ static AICORE void hadamard_vf(__ubuf__ half *x)
                 vdintlv(e2, o2, v2, v2); vdintlv(e3, o3, v3, v3);
                 vdintlv(e4, o4, v4, v4); vdintlv(e5, o5, v5, v5);
                 vdintlv(e6, o6, v6, v6); vdintlv(e7, o7, v7, v7);
-                // sums -> low 64 lanes (merge preserves high half)
-                vadd(v0, e0, o0, mlo, MODE_MERGING); vadd(v1, e1, o1, mlo, MODE_MERGING);
-                vadd(v2, e2, o2, mlo, MODE_MERGING); vadd(v3, e3, o3, mlo, MODE_MERGING);
-                vadd(v4, e4, o4, mlo, MODE_MERGING); vadd(v5, e5, o5, mlo, MODE_MERGING);
-                vadd(v6, e6, o6, mlo, MODE_MERGING); vadd(v7, e7, o7, mlo, MODE_MERGING);
-                // diffs -> high 64 lanes (merge preserves the sums just written)
-                vsub(v0, e0, o0, mhi, MODE_MERGING); vsub(v1, e1, o1, mhi, MODE_MERGING);
-                vsub(v2, e2, o2, mhi, MODE_MERGING); vsub(v3, e3, o3, mhi, MODE_MERGING);
-                vsub(v4, e4, o4, mhi, MODE_MERGING); vsub(v5, e5, o5, mhi, MODE_MERGING);
-                vsub(v6, e6, o6, mhi, MODE_MERGING); vsub(v7, e7, o7, mhi, MODE_MERGING);
+                vadd(s0, e0, o0, p); vadd(s1, e1, o1, p);
+                vadd(s2, e2, o2, p); vadd(s3, e3, o3, p);
+                vadd(s4, e4, o4, p); vadd(s5, e5, o5, p);
+                vadd(s6, e6, o6, p); vadd(s7, e7, o7, p);
+                vsub(d0, e0, o0, p); vsub(d1, e1, o1, p);
+                vsub(d2, e2, o2, p); vsub(d3, e3, o3, p);
+                vsub(d4, e4, o4, p); vsub(d5, e5, o5, p);
+                vsub(d6, e6, o6, p); vsub(d7, e7, o7, p);
+                vsel(v0, s0, d0, mlo); vsel(v1, s1, d1, mlo);
+                vsel(v2, s2, d2, mlo); vsel(v3, s3, d3, mlo);
+                vsel(v4, s4, d4, mlo); vsel(v5, s5, d5, mlo);
+                vsel(v6, s6, d6, mlo); vsel(v7, s7, d7, mlo);
             }
             vmuls(v0, v0, inv, p, MODE_ZEROING); vmuls(v1, v1, inv, p, MODE_ZEROING);
             vmuls(v2, v2, inv, p, MODE_ZEROING); vmuls(v3, v3, inv, p, MODE_ZEROING);
