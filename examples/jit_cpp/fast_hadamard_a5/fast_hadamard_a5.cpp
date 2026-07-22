@@ -51,10 +51,10 @@ using namespace pto;
 #ifndef ROWS_PER_TILE
 #define ROWS_PER_TILE 256
 #endif
-// Software-pipeline width. The butterfly body is manually unrolled 4-way
+// Software-pipeline width. The butterfly body is manually unrolled 8-way
 // (see hadamard_vf) to hide the vdintlv->vadd->vsub->vsel dependency-chain
-// latency across independent registers; REGS_PER_TILE must be a multiple of 4.
-#define HAD_UNROLL 4
+// latency across independent registers; REGS_PER_TILE must be a multiple of 8.
+#define HAD_UNROLL 8
 
 static_assert(HAD_N >= 2 && HAD_N <= 128, "register kernel supports N in [2,128]");
 static_assert((HAD_N & (HAD_N - 1)) == 0, "HAD_N must be a power of two");
@@ -113,35 +113,48 @@ __tf__ static AICORE void hadamard_vf(__ubuf__ half *x)
         MaskReg mlo = CreatePredicate<half>(lh);         // lanes 0..63 active
         const half inv = (half)HAD_INV_SQRT;
 
-        // 4-way software pipeline: issue the SAME op for 4 independent
+        // 8-way software pipeline: issue the SAME op for HAD_UNROLL independent
         // registers back-to-back so the vector pipe stays busy through each
         // op's latency instead of stalling on the vdintlv->vadd->vsub->vsel
         // dependency chain of a single register. Explicit (not array/loop)
         // because __VEC_SCOPE__ requires individually-named RegTensors.
-        for (uint16_t base = 0; base < (uint16_t)REGS_PER_TILE; base += 4) {
-            RegTensor<half> v0, v1, v2, v3, e0, e1, e2, e3, o0, o1, o2, o3,
-                            s0, s1, s2, s3, d0, d1, d2, d3;
+        for (uint16_t base = 0; base < (uint16_t)REGS_PER_TILE; base += 8) {
+            RegTensor<half> v0, v1, v2, v3, v4, v5, v6, v7;
+            RegTensor<half> e0, e1, e2, e3, e4, e5, e6, e7;
+            RegTensor<half> o0, o1, o2, o3, o4, o5, o6, o7;
+            RegTensor<half> s0, s1, s2, s3, s4, s5, s6, s7;
+            RegTensor<half> d0, d1, d2, d3, d4, d5, d6, d7;
             const uint32_t b = base * LANES_B16;
-            vlds(v0, x, b + 0 * LANES_B16, NORM);
-            vlds(v1, x, b + 1 * LANES_B16, NORM);
-            vlds(v2, x, b + 2 * LANES_B16, NORM);
-            vlds(v3, x, b + 3 * LANES_B16, NORM);
+            vlds(v0, x, b + 0 * LANES_B16, NORM); vlds(v1, x, b + 1 * LANES_B16, NORM);
+            vlds(v2, x, b + 2 * LANES_B16, NORM); vlds(v3, x, b + 3 * LANES_B16, NORM);
+            vlds(v4, x, b + 4 * LANES_B16, NORM); vlds(v5, x, b + 5 * LANES_B16, NORM);
+            vlds(v6, x, b + 6 * LANES_B16, NORM); vlds(v7, x, b + 7 * LANES_B16, NORM);
             for (uint16_t st = 0; st < (uint16_t)HAD_LOG2N; ++st) {
                 vdintlv(e0, o0, v0, v0); vdintlv(e1, o1, v1, v1);
                 vdintlv(e2, o2, v2, v2); vdintlv(e3, o3, v3, v3);
+                vdintlv(e4, o4, v4, v4); vdintlv(e5, o5, v5, v5);
+                vdintlv(e6, o6, v6, v6); vdintlv(e7, o7, v7, v7);
                 vadd(s0, e0, o0, p); vadd(s1, e1, o1, p);
                 vadd(s2, e2, o2, p); vadd(s3, e3, o3, p);
+                vadd(s4, e4, o4, p); vadd(s5, e5, o5, p);
+                vadd(s6, e6, o6, p); vadd(s7, e7, o7, p);
                 vsub(d0, e0, o0, p); vsub(d1, e1, o1, p);
                 vsub(d2, e2, o2, p); vsub(d3, e3, o3, p);
+                vsub(d4, e4, o4, p); vsub(d5, e5, o5, p);
+                vsub(d6, e6, o6, p); vsub(d7, e7, o7, p);
                 vsel(v0, s0, d0, mlo); vsel(v1, s1, d1, mlo);
                 vsel(v2, s2, d2, mlo); vsel(v3, s3, d3, mlo);
+                vsel(v4, s4, d4, mlo); vsel(v5, s5, d5, mlo);
+                vsel(v6, s6, d6, mlo); vsel(v7, s7, d7, mlo);
             }
             vmuls(v0, v0, inv, p, MODE_ZEROING); vmuls(v1, v1, inv, p, MODE_ZEROING);
             vmuls(v2, v2, inv, p, MODE_ZEROING); vmuls(v3, v3, inv, p, MODE_ZEROING);
-            vsts(v0, x, b + 0 * LANES_B16, NORM_B16, p);
-            vsts(v1, x, b + 1 * LANES_B16, NORM_B16, p);
-            vsts(v2, x, b + 2 * LANES_B16, NORM_B16, p);
-            vsts(v3, x, b + 3 * LANES_B16, NORM_B16, p);
+            vmuls(v4, v4, inv, p, MODE_ZEROING); vmuls(v5, v5, inv, p, MODE_ZEROING);
+            vmuls(v6, v6, inv, p, MODE_ZEROING); vmuls(v7, v7, inv, p, MODE_ZEROING);
+            vsts(v0, x, b + 0 * LANES_B16, NORM_B16, p); vsts(v1, x, b + 1 * LANES_B16, NORM_B16, p);
+            vsts(v2, x, b + 2 * LANES_B16, NORM_B16, p); vsts(v3, x, b + 3 * LANES_B16, NORM_B16, p);
+            vsts(v4, x, b + 4 * LANES_B16, NORM_B16, p); vsts(v5, x, b + 5 * LANES_B16, NORM_B16, p);
+            vsts(v6, x, b + 6 * LANES_B16, NORM_B16, p); vsts(v7, x, b + 7 * LANES_B16, NORM_B16, p);
         }
     }
 }

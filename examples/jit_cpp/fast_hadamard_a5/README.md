@@ -94,12 +94,13 @@ Every compute op is a single 128-lane fp16 SIMD instruction on RVECEX: one
 `vadd`/`vsub` computes all N/2 butterflies of a stage at once. The `log2(N)`
 stages are serial (inherent to the FWHT).
 
-**Grid fill matters more than the kernel.** Wall time is set by how many of the
-16 AIV (8 AIC × 2 vector subblocks) are busy = number of tiles = `batch /
-ROWS_PER_TILE`. Under-tiling is the trap: with `ROWS_PER_TILE=128` and batch=256
-only 2 of 16 AIV ran (12,924 ticks); lowering to `ROWS_PER_TILE=16` gives 16
-tiles → all AIV busy → **3,939 ticks (3.3× faster)**, same numerics. The default
-is 16 for this reason; tune it so `batch / ROWS_PER_TILE >= 16`.
+**Grid fill vs burst size — two competing knobs.** Wall time depends on both how
+many AIV are busy (= number of tiles = `batch / ROWS_PER_TILE`, want ≥ #AIV) and
+how large each DMA burst is (bigger = better HBM utilization). `ROWS_PER_TILE`
+defaults to 256 (a 64 KB burst); tune it so `batch / ROWS_PER_TILE >= (#AIV)`
+still holds for your batch. The camodel models compute ticks only (no HBM), so
+burst-size effects show up on real hardware, not here — see the on-device
+numbers above.
 
 ## Build & test (self-contained sim)
 
@@ -139,10 +140,15 @@ Two levers matter for utilization; both are in the kernel now:
   (the earlier 16 → 4 KB) leave the HBM path idle and pay per-tile sync
   overhead. Larger tiles drive bigger contiguous bursts. Trade-off: for a given
   batch, keep `batch / ROWS_PER_TILE >= (#AIV)` so the grid still fills.
-- **Register software-pipelining** (`hadamard_vf` is unrolled 4-way). The
+- **Register software-pipelining** (`hadamard_vf` is unrolled 8-way). The
   butterfly is a `vdintlv→vadd→vsub→vsel` dependency chain; issuing each op for
-  4 independent registers back-to-back hides the per-op latency instead of
+  8 independent registers back-to-back hides the per-op latency instead of
   stalling on it.
+
+Measured on a real 950 (batch=65536): the `--copy-floor` DMA ceiling is
+~2.5 TB/s, so memory is not the wall; the Hadamard reaches ~0.78 TB/s
+(`had/copy ≈ 0.31`), i.e. compute-bound. Bigger radix (radix-4 to halve the
+stage count) is the next lever if more is needed.
 
 Use `--copy-floor` to measure the pure GM→UB→GM DMA ceiling (same tiling) and
 print `had/copy` — the fraction of copy speed the transform achieves. If
