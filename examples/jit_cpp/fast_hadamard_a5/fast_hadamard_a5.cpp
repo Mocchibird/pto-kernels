@@ -49,7 +49,13 @@ using namespace pto;
 // 2*ROWS_PER_TILE*256 B must fit the UB budget below. For a given batch, pick
 // ROWS_PER_TILE so batch/ROWS_PER_TILE >= (# AIV) to still fill the grid.
 #ifndef ROWS_PER_TILE
-#define ROWS_PER_TILE 256
+#define ROWS_PER_TILE 128
+#endif
+// Pipeline depth (UB buffers). Load/compute/store is a 3-stage pipeline, so >=3
+// buffers are needed for store(i) to overlap compute(i+1) and load(i+2); with 2
+// buffers the in-place compute stacks on the store (measured had/copy ~0.34).
+#ifndef NBUF
+#define NBUF 4
 #endif
 // Software-pipeline width. The butterfly body is manually unrolled 8-way
 // (see hadamard_vf) to hide the vdintlv->vadd->vsub->vsel dependency-chain
@@ -76,9 +82,9 @@ constexpr unsigned FLAT = ROWS_PER_TILE * HAD_N; // = REGS_PER_TILE * 128
 
 constexpr unsigned aln256(unsigned b) { return (b + 255u) & ~255u; }
 constexpr unsigned X_BYTES = aln256(FLAT * sizeof(half));
-constexpr unsigned UB_X0 = 0;
-constexpr unsigned UB_X1 = UB_X0 + X_BYTES;      // ping/pong
-static_assert(UB_X1 + X_BYTES <= 192u * 1024u, "UB overflow (>192 KB)");
+// buffer b base = b * X_BYTES (inlined at call sites; runtime index)
+static_assert(NBUF * X_BYTES <= 192u * 1024u, "UB overflow (>192 KB): lower ROWS_PER_TILE or NBUF");
+static_assert(NBUF <= 8, "at most 8 event IDs per pipe-pair");
 
 // 1/sqrt(N): host may override via -DHAD_INV_SQRT to avoid device sqrt.
 #ifndef HAD_INV_SQRT
@@ -173,8 +179,8 @@ __global__ AICORE void fast_hadamard_a5(__gm__ void *x_gm, uint32_t batch)
     using St = pto::Stride<1, 1, 1, FLAT, 1>;
     using FlatTile = Tile<TileType::Vec, half, 1, FLAT, BLayout::RowMajor, 1, FLAT>;
 
-    const unsigned x_off[2] = {UB_X0, UB_X1};
-    const event_t ev[2] = {EVENT_ID0, EVENT_ID1};
+    const event_t ev[8] = {EVENT_ID0, EVENT_ID1, EVENT_ID2, EVENT_ID3,
+                           EVENT_ID4, EVENT_ID5, EVENT_ID6, EVENT_ID7};
 
     // On A5, get_block_idx()/get_block_num() already enumerate all vector
     // subblocks (AIVs): a block_dim=8 launch yields block ids 0..15, and the two
@@ -186,22 +192,22 @@ __global__ AICORE void fast_hadamard_a5(__gm__ void *x_gm, uint32_t batch)
     const uint32_t num_cores = get_block_num();
     const uint32_t tiles = batch / ROWS_PER_TILE;   // batch MUST be a multiple of ROWS_PER_TILE
 
-    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+    for (uint32_t b = 0; b < NBUF; ++b) set_flag(PIPE_MTE3, PIPE_MTE2, ev[b]);
 
     uint32_t it = 0;
     for (uint32_t tb = cid; tb < tiles; tb += num_cores, ++it) {
-        const int pp = it & 1;
+        const int pp = it % NBUF;
+        const unsigned xb = (unsigned)pp * X_BYTES;
         const uint64_t off = static_cast<uint64_t>(tb) * FLAT;
         GlobalTensor<half, Sh, St> g(reinterpret_cast<__gm__ half *>(x_gm) + off, Sh());
 
         wait_flag(PIPE_MTE3, PIPE_MTE2, ev[pp]);
-        FlatTile xt;  TASSIGN(xt, x_off[pp]);
+        FlatTile xt;  TASSIGN(xt, xb);
         TLOAD(xt, g);
         set_flag(PIPE_MTE2, PIPE_V, ev[pp]);
         wait_flag(PIPE_MTE2, PIPE_V, ev[pp]);
 
-        hadamard_vf((__ubuf__ half *)(uintptr_t)x_off[pp]);
+        hadamard_vf((__ubuf__ half *)(uintptr_t)xb);
 
         set_flag(PIPE_V, PIPE_MTE3, ev[pp]);
         wait_flag(PIPE_V, PIPE_MTE3, ev[pp]);
@@ -209,8 +215,7 @@ __global__ AICORE void fast_hadamard_a5(__gm__ void *x_gm, uint32_t batch)
         set_flag(PIPE_MTE3, PIPE_MTE2, ev[pp]);
     }
 
-    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+    for (uint32_t b = 0; b < NBUF; ++b) wait_flag(PIPE_MTE3, PIPE_MTE2, ev[b]);
 #else
     (void)x_gm; (void)batch;
 #endif
@@ -232,30 +237,28 @@ __global__ AICORE void copy_ref_a5(__gm__ void *x_gm, uint32_t batch)
     using St = pto::Stride<1, 1, 1, FLAT, 1>;
     using FlatTile = Tile<TileType::Vec, half, 1, FLAT, BLayout::RowMajor, 1, FLAT>;
 
-    const unsigned x_off[2] = {UB_X0, UB_X1};
-    const event_t ev[2] = {EVENT_ID0, EVENT_ID1};
+    const event_t ev[8] = {EVENT_ID0, EVENT_ID1, EVENT_ID2, EVENT_ID3,
+                           EVENT_ID4, EVENT_ID5, EVENT_ID6, EVENT_ID7};
     const uint32_t cid = get_block_idx();
     const uint32_t num_cores = get_block_num();
     const uint32_t tiles = batch / ROWS_PER_TILE;
 
-    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+    for (uint32_t b = 0; b < NBUF; ++b) set_flag(PIPE_MTE3, PIPE_MTE2, ev[b]);
 
     uint32_t it = 0;
     for (uint32_t tb = cid; tb < tiles; tb += num_cores, ++it) {
-        const int pp = it & 1;
+        const int pp = it % NBUF;
         const uint64_t off = static_cast<uint64_t>(tb) * FLAT;
         GlobalTensor<half, Sh, St> g(reinterpret_cast<__gm__ half *>(x_gm) + off, Sh());
         wait_flag(PIPE_MTE3, PIPE_MTE2, ev[pp]);
-        FlatTile xt;  TASSIGN(xt, x_off[pp]);
+        FlatTile xt;  TASSIGN(xt, (unsigned)pp * X_BYTES);
         TLOAD(xt, g);
         set_flag(PIPE_MTE2, PIPE_MTE3, ev[pp]);
         wait_flag(PIPE_MTE2, PIPE_MTE3, ev[pp]);
         TSTORE(g, xt);
         set_flag(PIPE_MTE3, PIPE_MTE2, ev[pp]);
     }
-    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+    for (uint32_t b = 0; b < NBUF; ++b) wait_flag(PIPE_MTE3, PIPE_MTE2, ev[b]);
 #else
     (void)x_gm; (void)batch;
 #endif
