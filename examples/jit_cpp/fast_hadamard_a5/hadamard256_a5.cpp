@@ -24,11 +24,20 @@ constexpr unsigned LANES = 128;
 constexpr unsigned FLAT = ROWS_PER_TILE * HAD_N;          // f16 elems/tile
 constexpr unsigned X_BYTES = FLAT * sizeof(half);
 constexpr unsigned aln(unsigned b){ return (b+511u)&~511u; }
-constexpr unsigned X0 = 0, X1 = X0 + aln(X_BYTES), UB_END = X1 + aln(X_BYTES);
-static_assert(UB_END <= 192u*1024u, "UB overflow");
+#ifndef NBUF
+#define NBUF 4                       // pipeline depth (buffers)
+#endif
+#ifndef PREFETCH
+#define PREFETCH 2                   // tiles to prefetch ahead
+#endif
+#define XOFF(i) ((unsigned)(i) * ((X_BYTES + 511u) & ~511u))
+static_assert(NBUF * aln(X_BYTES) <= 192u*1024u, "UB overflow");
 
 #ifdef __DAV_VEC__
 #define DOU(M) M(0) M(1) M(2) M(3) M(4) M(5) M(6) M(7)
+// Deinterleave-LOAD 256-point WHT: even/odd split on the MTE load (vlds
+// DINTLV_B16), concat-halves recombine on the store (vsts to [0:128]/[128:256]),
+// only vadd/vsub on the vector-execute pipe -> memory-bound (~copy speed).
 __tf__ static AICORE void bfly256(__ubuf__ half *wb, uint32_t rows)
 {
     __VEC_SCOPE__
@@ -66,24 +75,39 @@ __global__ AICORE void hadamard256(__gm__ void *x_gm, uint32_t batch)
     set_mask_norm(); set_vector_mask(-1, -1);
     using Sh = pto::Shape<1,1,1,1,FLAT>; using St = pto::Stride<1,1,1,FLAT,1>;
     using T = Tile<TileType::Vec, half, 1, FLAT, BLayout::RowMajor, 1, FLAT>;
-    const unsigned xo[2] = {X0, X1}; const event_t ev[2] = {EVENT_ID0, EVENT_ID1};
+    const event_t ev[8] = {EVENT_ID0,EVENT_ID1,EVENT_ID2,EVENT_ID3,EVENT_ID4,EVENT_ID5,EVENT_ID6,EVENT_ID7};
+    const unsigned xoff[4] = {XOFF(0), XOFF(1), XOFF(2), XOFF(3)};
     const uint32_t cid = get_block_idx(), nc = get_block_num();
     const uint32_t tiles = batch / ROWS_PER_TILE;
-    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0); set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
-    uint32_t it = 0;
-    for (uint32_t tb = cid; tb < tiles; tb += nc, ++it) {
-        const int pp = it & 1; const uint64_t off = (uint64_t)tb * FLAT;
-        wait_flag(PIPE_MTE3, PIPE_MTE2, ev[pp]);
-        T xt; TASSIGN(xt, xo[pp]);
-        GlobalTensor<half, Sh, St> g((__gm__ half*)x_gm + off, Sh());
-        TLOAD(xt, g);
-        set_flag(PIPE_MTE2, PIPE_V, ev[pp]); wait_flag(PIPE_MTE2, PIPE_V, ev[pp]);
-        bfly256((__ubuf__ half*)(uintptr_t)xo[pp], ROWS_PER_TILE);
+
+    // issue the async load for this core's K-th tile into buffer K%NBUF
+#define ISSUE_LOAD(K) do {                                                     \
+        uint32_t _tb = cid + (uint32_t)(K) * nc;                               \
+        if (_tb < tiles) {                                                     \
+            const int _pp = (uint32_t)(K) % NBUF;                              \
+            wait_flag(PIPE_MTE3, PIPE_MTE2, ev[_pp]);                          \
+            T _xt; TASSIGN(_xt, xoff[_pp]);                                    \
+            GlobalTensor<half, Sh, St> _g((__gm__ half*)x_gm + (uint64_t)_tb * FLAT, Sh()); \
+            TLOAD(_xt, _g);                                                    \
+            set_flag(PIPE_MTE2, PIPE_V, ev[_pp]);                              \
+        } } while (0)
+
+    for (int i = 0; i < NBUF; ++i) set_flag(PIPE_MTE3, PIPE_MTE2, ev[i]);  // all free
+    for (uint32_t kk = 0; kk < (uint32_t)PREFETCH; ++kk) ISSUE_LOAD(kk);   // prologue
+
+    uint32_t k = 0;
+    for (uint32_t tb = cid; tb < tiles; tb += nc, ++k) {
+        const int pp = k % NBUF;
+        ISSUE_LOAD(k + PREFETCH);                    // prefetch (overlaps this compute)
+        wait_flag(PIPE_MTE2, PIPE_V, ev[pp]);        // this tile's load done
+        bfly256((__ubuf__ half*)(uintptr_t)xoff[pp], ROWS_PER_TILE);
         set_flag(PIPE_V, PIPE_MTE3, ev[pp]); wait_flag(PIPE_V, PIPE_MTE3, ev[pp]);
+        T xt; TASSIGN(xt, XOFF(pp));
+        GlobalTensor<half, Sh, St> g((__gm__ half*)x_gm + (uint64_t)tb * FLAT, Sh());
         TSTORE(g, xt);
-        set_flag(PIPE_MTE3, PIPE_MTE2, ev[pp]);
+        set_flag(PIPE_MTE3, PIPE_MTE2, ev[pp]);      // buffer free
     }
-    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0); wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+    for (int i = 0; i < NBUF; ++i) wait_flag(PIPE_MTE3, PIPE_MTE2, ev[i]);
 #else
     (void)x_gm;(void)batch;
 #endif
@@ -94,7 +118,7 @@ __global__ AICORE void copy256(__gm__ void *x_gm, uint32_t batch)
 #ifdef __DAV_VEC__
     using Sh = pto::Shape<1,1,1,1,FLAT>; using St = pto::Stride<1,1,1,FLAT,1>;
     using T = Tile<TileType::Vec, half, 1, FLAT, BLayout::RowMajor, 1, FLAT>;
-    const unsigned xo[2] = {X0, X1}; const event_t ev[2] = {EVENT_ID0, EVENT_ID1};
+    const unsigned xo[2] = {XOFF(0), XOFF(1)}; const event_t ev[2] = {EVENT_ID0, EVENT_ID1};
     const uint32_t cid = get_block_idx(), nc = get_block_num();
     const uint32_t tiles = batch / ROWS_PER_TILE;
     set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0); set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);

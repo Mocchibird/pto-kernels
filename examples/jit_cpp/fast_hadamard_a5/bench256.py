@@ -19,7 +19,10 @@ def sylvester(n):
 def build():
     src = HERE / "hadamard256_a5.cpp"; obj = HERE / "build/h256.o"; so = HERE / "build/h256.so"
     (HERE / "build").mkdir(exist_ok=True)
-    common = ["--cce-aicore-arch=dav-c310-vec", "-DREGISTER_BASE", "-DROWS_PER_TILE=64",
+    rows = os.environ.get("ROWS", "64"); nbuf = os.environ.get("NBUF", "4"); pf = os.environ.get("PF", "2")
+    print(f"[cfg] ROWS={rows} NBUF={nbuf} PREFETCH={pf}")
+    common = ["--cce-aicore-arch=dav-c310-vec", "-DREGISTER_BASE", f"-DROWS_PER_TILE={rows}",
+              f"-DNBUF={nbuf}", f"-DPREFETCH={pf}",
               "-O2", "-std=c++17", "-fPIC", "-Wno-ignored-attributes", "-Wno-macro-redefined",
               "-mllvm", "-cce-aicore-stack-size=0x8000", "-mllvm", "-cce-aicore-function-stack-size=0x8000",
               "-mllvm", "-cce-aicore-addr-transform", "-mllvm", "-cce-aicore-dcci-insert-for-scalar=false",
