@@ -1,4 +1,4 @@
-// hadamard256_a5 — N=256 Walsh-Hadamard via DEINTERLEAVE-LOAD butterfly.
+// fast_hadamard_256_a5 — N=256 Walsh-Hadamard via DEINTERLEAVE-LOAD butterfly.
 // Each stage does the even/odd split on the MTE2 load (vlds DINTLV_B16) and the
 // concat-halves recombine on the MTE3 store (vsts to [0:128] / [128:256]),
 // leaving only vadd/vsub on the vector-execute pipe. In-place on a UB tile.

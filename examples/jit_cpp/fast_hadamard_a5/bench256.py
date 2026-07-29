@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate + benchmark the N=256 deinterleave-load WHT (hadamard256_a5.cpp)."""
+"""Validate + benchmark the N=256 deinterleave-load WHT (fast_hadamard_256_a5.cpp)."""
 import ctypes, os, subprocess, sys
 from pathlib import Path
 import numpy as np, torch, torch_npu  # noqa
@@ -17,7 +17,7 @@ def sylvester(n):
 
 
 def build():
-    src = HERE / "hadamard256_a5.cpp"; obj = HERE / "build/h256.o"; so = HERE / "build/h256.so"
+    src = HERE / "fast_hadamard_256_a5.cpp"; obj = HERE / "build/h256.o"; so = HERE / "build/h256.so"
     (HERE / "build").mkdir(exist_ok=True)
     rows = os.environ.get("ROWS", "64"); nbuf = os.environ.get("NBUF", "4"); pf = os.environ.get("PF", "2")
     print(f"[cfg] ROWS={rows} NBUF={nbuf} PREFETCH={pf}")

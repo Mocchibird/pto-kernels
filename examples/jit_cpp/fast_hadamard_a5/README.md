@@ -171,7 +171,7 @@ print `had/copy` — the fraction of copy speed the transform achieves. If
 
 ## Files
 
-- `fast_hadamard_a5.cpp` — the kernel (register-resident butterfly + ping/pong DMA).
+- `fast_hadamard_128_a5.cpp` — the kernel (register-resident butterfly + ping/pong DMA).
 - `sim_test/main.cpp`, `sim_test/run.sh` — self-contained on-device correctness test.
 - `benchmark.py` — on-device benchmark: compile + correctness + bandwidth (real 950).
 - `run_benchmark.sh` — one-command wrapper (sets env, runs `benchmark.py`).

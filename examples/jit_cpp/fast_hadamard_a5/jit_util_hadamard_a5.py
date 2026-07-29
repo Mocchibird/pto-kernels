@@ -26,11 +26,11 @@ def _ascend_home() -> str:
 
 def compile_kernel(n: int = 128, src: Path | None = None, out_dir: Path | None = None,
                    verbose: bool = True, force: bool = False) -> Path:
-    """Compile fast_hadamard_a5.cpp to a device .so for the given block size N.
+    """Compile fast_hadamard_128_a5.cpp to a device .so for the given block size N.
 
     Skips the bisheng invocation when an up-to-date .so already exists (pass
     force=True to always rebuild)."""
-    src = Path(src) if src else HERE / "fast_hadamard_a5.cpp"
+    src = Path(src) if src else HERE / "fast_hadamard_128_a5.cpp"
     out_dir = Path(out_dir) if out_dir else HERE / "build"
     out_dir.mkdir(parents=True, exist_ok=True)
     home = _ascend_home()

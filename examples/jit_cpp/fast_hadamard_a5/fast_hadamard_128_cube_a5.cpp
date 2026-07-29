@@ -1,9 +1,9 @@
-// hadamard_cube_a5 — A5 (Ascend 950 / dav-c310) CUBE-core fp16 Walsh-Hadamard
+// fast_hadamard_128_cube_a5 — A5 (Ascend 950 / dav-c310) CUBE-core fp16 Walsh-Hadamard
 // transform for N == 128, computed as a matmul against the Sylvester matrix.
 //
 // WHY
 // ---
-// The register-resident VF kernel (fast_hadamard_a5.cpp) is compute-bound on the
+// The register-resident VF kernel (fast_hadamard_128_a5.cpp) is compute-bound on the
 // vector pipe at ~1.5 TB/s (~half of the ~3 TB/s HBM copy floor). The WHT is
 // really Y = X @ H, H = Sylvester(128)/sqrt(128) (symmetric, +/-1). The cube
 // (matrix) unit does that matmul cheaply relative to the memory traffic, so this

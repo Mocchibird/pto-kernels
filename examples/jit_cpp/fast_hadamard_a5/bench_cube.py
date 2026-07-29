@@ -27,7 +27,7 @@ def _home():
 def build_cube():
     home = _home()
     bisheng, inc = f"{home}/bin/bisheng", f"{home}/aarch64-linux/include"
-    src, obj, so = HERE / "hadamard_cube_a5.cpp", HERE / "build/hcube.o", HERE / "build/hcube.so"
+    src, obj, so = HERE / "fast_hadamard_128_cube_a5.cpp", HERE / "build/hcube.o", HERE / "build/hcube.so"
     (HERE / "build").mkdir(exist_ok=True)
     common = ["--cce-aicore-arch=dav-c310-cube", "-DHAD_N=128", "-O2", "-std=c++17", "-fPIC",
               "-Wno-ignored-attributes", "-Wno-macro-redefined",

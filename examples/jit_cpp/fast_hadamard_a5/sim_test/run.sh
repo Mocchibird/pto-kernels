@@ -35,7 +35,7 @@ echo "==> Compiling fast_hadamard_a5 (N=${N_DIM} log2=${LOG2N} batch=${BATCH_DIM
   -mllvm -cce-aicore-record-overflow=true -mllvm -cce-aicore-addr-transform \
   -mllvm -cce-aicore-dcci-insert-for-scalar=false -Xhost-start -Xhost-end \
   -I"${PTO_INC}" -I"${ASCEND_HOME_PATH}/include" -I"${ASCEND_DRIVER_PATH}/kernel/inc" \
-  -c "${KERNEL_DIR}/fast_hadamard_a5.cpp" -o k.o
+  -c "${KERNEL_DIR}/fast_hadamard_128_a5.cpp" -o k.o
 "${BISHENG}" -fPIC -shared --cce-fatobj-link -Wl,-soname,libk.so k.o -o libk.so
 
 echo "==> Compiling host main.cpp"

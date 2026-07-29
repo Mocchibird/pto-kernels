@@ -1,4 +1,4 @@
-// fast_hadamard_a5 — A5 (Ascend 950 / dav-c310) register-resident fp16
+// fast_hadamard_128_a5 — A5 (Ascend 950 / dav-c310) register-resident fp16
 // Walsh-Hadamard transform for block size N <= 128.
 //
 // WHY THIS EXISTS
