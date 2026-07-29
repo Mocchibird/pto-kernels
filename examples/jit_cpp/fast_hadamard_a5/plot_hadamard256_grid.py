@@ -9,13 +9,27 @@ copy_gbs,ratio) and renders two panels into a single PNG:
   * a bandwidth-vs-batch line comparing the transform against the copy floor.
 """
 import argparse
+import csv
 import sys
 from collections import defaultdict
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "fast_hadamard"))
+# Self-contained (matplotlib only). The shared plot_common pulls in
+# jit_util_common -> torch, which the matplotlib-only plotting env lacks, so we
+# keep the same look without that dependency.
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except ImportError:
+    plt = None
 
-from plot_common import ensure_matplotlib, load_nonempty_rows, plt, save_figure
+
+def _read_rows(csv_path: Path):
+    with open(csv_path, newline="") as handle:
+        for record in csv.DictReader(handle):
+            if record.get("batch"):
+                yield record
 
 DEFAULT_CSV = Path("build") / "grid256.csv"
 DEFAULT_PLOT_NAME = "hadamard256_grid.png"
@@ -37,7 +51,7 @@ def _load_grid(csv_path: Path):
     had = defaultdict(dict)
     copy_floor = {}
     rows_seen, batches_seen = set(), set()
-    for record in load_nonempty_rows(csv_path):
+    for record in _read_rows(csv_path):
         rows = int(record["rows"])
         batch = int(record["batch"])
         rows_seen.add(rows)
@@ -90,7 +104,8 @@ def _draw_bandwidth_line(axis, batches_sorted, had, copy_floor):
 
 def main():
     args = _parse_args()
-    if not ensure_matplotlib():
+    if plt is None:
+        print("matplotlib is not installed; skipping plot generation.", file=sys.stderr)
         return
     if not args.csv.exists():
         print(f"error: {args.csv} not found (run bench256_grid.py first)", file=sys.stderr)
@@ -101,9 +116,11 @@ def main():
     _draw_heatmap(heatmap_axis, rows_sorted, batches_sorted, ratio)
     _draw_bandwidth_line(line_axis, batches_sorted, had, copy_floor)
     fig.suptitle("fast_hadamard_256_a5 on Ascend A5 (dav-c310) — memory-bound, at the copy floor")
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
 
     output_path = args.csv.parent / args.plot_name
-    save_figure(fig, output_path)
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
     print(f"wrote {output_path}")
 
 
