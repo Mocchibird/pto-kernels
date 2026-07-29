@@ -72,6 +72,14 @@ Interactive version: https://claude.ai/code/artifact/e2b9f64a-1a91-4a24-9f83-11f
 - **Correctness verified for every config** (batch 4096): max rel error 8.5e-4 vs
   x·Sylvester(256), *identical* across all ROWS_PER_TILE (tiling doesn't perturb the
   math); `copy256` preserves data bit-exactly (max|Δ|=0) at every config.
+- **UB budget / pipeline depth** (`bench256_nbuf.py`): the A5 has **248 KB** UB, not
+  the 192 KB the kernels hard-code. Raising the budget and deepening the pipeline
+  helps only up to `NBUF=4` (e.g. batch 64k: `NBUF=2` 2.2 TB/s → `NBUF=4` 2.7 TB/s);
+  `NBUF>=6` **reproducibly device-faults** (error 507035) because the kernel reuses
+  one event ID per buffer for all three pipe handoffs, which tops out ~4 outstanding
+  loads. `NBUF=4` already fits 192 KB for these tiles, so **UB capacity is not the
+  bottleneck — the event-flag protocol is** (and it is copy-bound at large batch
+  regardless). `UB_USABLE_BYTES` is now overridable if the sync is ever reworked.
 - Measurement note: an earlier version recompiled the copy reference at each ROWS and
   used a single timed loop, which produced physically-impossible >5 TB/s copy reads
   (an over-budget 2-buffer copy at ROWS=256 + timer glitches). Fixed via the fixed

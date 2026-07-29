@@ -31,7 +31,13 @@ constexpr unsigned aln(unsigned b){ return (b+511u)&~511u; }
 #define PREFETCH 2                   // tiles to prefetch ahead
 #endif
 #define XOFF(i) ((unsigned)(i) * ((X_BYTES + 511u) & ~511u))
-static_assert(NBUF * aln(X_BYTES) <= 192u*1024u, "UB overflow");
+// A5 UB is 248 KB physical, but this kernel's per-buffer event-ID reuse tops out
+// at ~NBUF=4 (deeper -> runtime device fault 507035), which fits 192 KB for these
+// tiles -- so UB capacity is not the bottleneck here (see bench256_nbuf.py).
+#ifndef UB_USABLE_BYTES
+#define UB_USABLE_BYTES (192u * 1024u)
+#endif
+static_assert(NBUF * aln(X_BYTES) <= UB_USABLE_BYTES, "UB overflow");
 
 #ifdef __DAV_VEC__
 #define DOU(M) M(0) M(1) M(2) M(3) M(4) M(5) M(6) M(7)
