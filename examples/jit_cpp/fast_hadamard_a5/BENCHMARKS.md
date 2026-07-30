@@ -74,12 +74,21 @@ Interactive version: https://claude.ai/code/artifact/e2b9f64a-1a91-4a24-9f83-11f
   math); `copy256` preserves data bit-exactly (max|Δ|=0) at every config.
 - **UB budget / pipeline depth** (`bench256_nbuf.py`): the A5 has **248 KB** UB, not
   the 192 KB the kernels hard-code. Raising the budget and deepening the pipeline
-  helps only up to `NBUF=4` (e.g. batch 64k: `NBUF=2` 2.2 TB/s → `NBUF=4` 2.7 TB/s);
-  `NBUF>=6` **reproducibly device-faults** (error 507035) because the kernel reuses
-  one event ID per buffer for all three pipe handoffs, which tops out ~4 outstanding
-  loads. `NBUF=4` already fits 192 KB for these tiles, so **UB capacity is not the
-  bottleneck — the event-flag protocol is** (and it is copy-bound at large batch
-  regardless). `UB_USABLE_BYTES` is now overridable if the sync is ever reworked.
+  helps only up to `NBUF=4` (e.g. batch 64k: `NBUF=2` 2.2 TB/s → `NBUF=4` 2.7 TB/s).
+  `NBUF>=6` device-faulted with error 507035, and **the explanation previously given
+  here was wrong**: it blamed the kernel reusing one event ID per buffer across all
+  three pipe handoffs. It was not the event protocol — `ev[8]` was correctly sized
+  and the token accounting balances for any NBUF. The real cause was a fixed
+  `unsigned xoff[4]` table of UB offsets indexed by `K % NBUF`, i.e. an
+  out-of-bounds read for NBUF>4, which at ROWS=64 also slips past the UB
+  static_assert because 6 × 32 KB is exactly 192 KB. Fixed on branch
+  `fast-hadamard-a5-pr` (PR #221) by computing offsets with the `XOFF()` macro.
+  **Device-verified 2026-07-29** with that fix: NBUF=6 runs correctly and is ~1%
+  *slower* than NBUF=4 (2634 vs 2668 GB/s at batch 65536, ROWS_PER_TILE=64), and
+  raising the budget to the physical 248 KB changes nothing (2622 GB/s). So the
+  original conclusion — UB capacity is not the bottleneck — was right, but the
+  reason was not: the transform is simply HBM-bound, and four buffers already
+  saturate the load and store pipes. `UB_USABLE_BYTES` remains overridable.
 - Measurement note: an earlier version recompiled the copy reference at each ROWS and
   used a single timed loop, which produced physically-impossible >5 TB/s copy reads
   (an over-budget 2-buffer copy at ROWS=256 + timer glitches). Fixed via the fixed
