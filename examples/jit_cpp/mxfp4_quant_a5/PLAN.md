@@ -819,3 +819,35 @@ bf16:  byte = b -   2 + p - L      mult bf16 exp field = 256 - b     b clamped t
 **Roofline, K=256, batch 65536:** 42.47 MB ⇒ **14.0–14.8 µs** at the measured 2.87–3.03 TB/s copy floor. Batch 16384 is launch-bound (~11 µs floor > 3.7 µs roofline) — exclude from bandwidth claims.
 
 **Do not:** index a buffer-offset table by `K % NBUF` (the real 507035 cause — use `XOFF()`) · add `__init__.py` · add a shebang to a `.py` · use `vrec`/`vdiv` for the reciprocal · search nibble orders · gate on an aggregate L2 · report a number from a step whose correctness gate did not pass.
+
+### Implementation status 2026-07-30 (end of first coding pass)
+
+`mxfp4_quant_a5.cpp` compiles for dav-c310-vec but **has never produced verified
+output**. `mxfp4_ref.py` (host reference) self-checks: the FLOOR rule puts amax/X in
+[4, 7.84] and the round trip is 0.23 rel err, as 4-bit should be.
+
+**The current kernel structure is wrong and needs the 3-pass form of section 4.4.**
+Two reasons, both now pinned against CANN's own `pto/npu/a5/TQuant.hpp`:
+
+1. **`vcgmax` reduces over 8 lanes, not 32.** TQuant builds a 32-block max as
+   `vmax` folding 4:1 across registers followed by one `vcgmax` (:79-82), i.e.
+   32 = 4 x 8. A single `vcgmax` (what this kernel does) computes an 8-element max
+   and therefore the wrong scale.
+2. **There is no in-register lane broadcast.** The per-block max must go out to a UB
+   scratch and come back through a broadcast-expand *load*:
+   `vlds(v_scale, scalingPtr, 8*i, E2B_B32)` (:214), or `BRC_B32` for a single
+   scalar (:193, :325). TQuant's MXFP8 path is exactly the shape this kernel wants:
+   broadcast-load the scale, `DINTLV` the data, `vmul`, then two `vcvt` into
+   PART_P0/PART_P1 (:212-218).
+
+So the loop is: pass A reduce to compacted maxima -> store; pass B derive e8m0 byte
+and the reciprocal multiplier; pass C broadcast-reload, multiply, cast, pack. Trying
+to fuse A and C into one pass cannot work, because the broadcast needs the UB trip.
+
+Also unresolved and needed before the packed output can be checked: feeding PART_P0..P3
+four sequential 64-element blocks leaves byte `4j+x` holding elements `64x+2j`, while
+the format wants byte `p` to hold elements `2p, 2p+1`. Either feed each phase the
+strided pairs `8j+2x, 8j+2x+1`, or emit sequentially and undo the 4-way byte
+interleave with two `vdintlv` rounds (the trick fast_hadamard_256_a5 already uses).
+
+Nothing here is measured against torch yet; there is no performance claim to make.
