@@ -15,6 +15,40 @@ No UB traffic and no `TGATHER` between stages. It is a good first A5 kernel and
 composes with MXFP quantization (e.g. MXFP4 training) — the transform result can
 be cast/quantized straight out of the register.
 
+---
+
+> **Status note (2026-07-30): the N=256 kernel and its tooling now track PR #221.**
+>
+> `fast_hadamard_256_a5.cpp` here is the version from branch `fast-hadamard-a5-pr`
+> (upstream PR #221), which differs from what this branch previously carried in
+> three ways that matter:
+>
+> - **Buffer offsets come from the `XOFF()` macro, not a fixed `xoff[4]` table.**
+>   The table was indexed by `K % NBUF`, so any `NBUF > 4` build read past its end.
+>   That out-of-bounds read — not the event-flag protocol — was the real cause of
+>   device fault 507035; see the corrected note in `BENCHMARKS.md`.
+> - **`copy256` moved into its own translation unit**, `copy_ref_256_a5.cpp`, so the
+>   transform is standalone. The scripts here that call `call_copy256`
+>   (`bench256.py`, `bench256_grid.py`, `bench256_nbuf.py`, `check256_grid.py`) now
+>   compile and link that second TU, so they keep working unchanged. `check256_grid.py`
+>   no longer sweeps `ROWS_PER_TILE=256`: the copy TU's 2-buffer ping/pong needs
+>   2 × 128 KB there, which its UB `static_assert` now rejects rather than overrunning
+>   silently and corrupting the measured floor.
+> - **Block size N = 32…2048**, all within 0.90–0.96 of their own copy floor. For
+>   N < 256, `256/N` rows are packed into one window so every stage drives all 128
+>   fp16 lanes, with `8 − log2(N)` `vdintlv` undoing the resulting index rotation;
+>   for N > 256 a row is split into chunks. N=32 went from 0.30 to 0.96 of its floor.
+>
+> New here from that branch: `copy_ref_256_a5.cpp`, `jit_util_copy256_a5.py`,
+> `jit_util_hadamard256_a5.py`, `test_hadamard256_a5.py`, `test_copy256_a5.py`,
+> `test_block_sizes_a5.py`, `plot_hadamard256_a5.py`, `plot_hadamard_nsweep_a5.py`.
+> The 128 / cube / dintlv / fused-MXFP4 kernels and their scripts are untouched.
+>
+> The older ad-hoc 256 scripts still carry the defects the code review found
+> (verdict printed then `exit 0`, pooled buffers saturating an unnormalized
+> transform, `PF`/`NBUF` taken from unvalidated env). `benchmark.py` on the PR branch
+> supersedes all of them; these are kept only so nothing that referenced them breaks.
+
 ## Algorithm
 
 Constant-geometry FWHT with a **concat-halves** recombine, per stage:

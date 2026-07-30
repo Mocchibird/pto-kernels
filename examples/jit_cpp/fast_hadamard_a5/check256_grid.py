@@ -9,7 +9,9 @@ import numpy as np, torch, torch_npu  # noqa
 HERE = Path(__file__).resolve().parent
 N = 256
 h = os.environ.get("ASCEND_HOME_PATH") or os.environ["ASCEND_TOOLKIT_HOME"]
-ROWS_LIST = [16, 32, 64, 128, 256]
+ROWS_LIST = [16, 32, 64, 128]  # 256 dropped: the copy TU's 2-buffer
+# ping/pong needs 2 x 128 KB there, which the UB static_assert now rejects (it used to
+# overrun silently and corrupt the measured floor)
 BATCH = 4096
 
 
@@ -26,23 +28,77 @@ def nbuf_for(rows):
 
 def build(rows, nbuf, pf):
     src = HERE / "fast_hadamard_256_a5.cpp"
-    obj = HERE / f"build/c256_{rows}.o"; so = HERE / f"build/c256_{rows}.so"
+    obj = HERE / f"build/c256_{rows}.o"
+    so = HERE / f"build/c256_{rows}.so"
     (HERE / "build").mkdir(exist_ok=True)
-    common = ["--cce-aicore-arch=dav-c310-vec", "-DREGISTER_BASE", f"-DROWS_PER_TILE={rows}",
-              f"-DNBUF={nbuf}", f"-DPREFETCH={pf}", "-O2", "-std=c++17", "-fPIC",
-              "-Wno-ignored-attributes", "-Wno-macro-redefined",
-              "-mllvm", "-cce-aicore-stack-size=0x8000", "-mllvm", "-cce-aicore-function-stack-size=0x8000",
-              "-mllvm", "-cce-aicore-addr-transform", "-mllvm", "-cce-aicore-dcci-insert-for-scalar=false",
-              "-Xhost-start", "-Xhost-end", f"-I{h}/aarch64-linux/include", f"-I{h}/include"]
-    r = subprocess.run([f"{h}/bin/bisheng", "-xcce", *common, "-c", str(src), "-o", str(obj)],
-                       capture_output=True, text=True)
+    common = [
+        "--cce-aicore-arch=dav-c310-vec",
+        "-DREGISTER_BASE",
+        f"-DROWS_PER_TILE={rows}",
+        f"-DNBUF={nbuf}",
+        f"-DPREFETCH={pf}",
+        "-O2",
+        "-std=c++17",
+        "-fPIC",
+        "-Wno-ignored-attributes",
+        "-Wno-macro-redefined",
+        "-mllvm",
+        "-cce-aicore-stack-size=0x8000",
+        "-mllvm",
+        "-cce-aicore-function-stack-size=0x8000",
+        "-mllvm",
+        "-cce-aicore-addr-transform",
+        "-mllvm",
+        "-cce-aicore-dcci-insert-for-scalar=false",
+        "-Xhost-start",
+        "-Xhost-end",
+        f"-I{h}/aarch64-linux/include",
+        f"-I{h}/include",
+    ]
+    r = subprocess.run(
+        [f"{h}/bin/bisheng", "-xcce", *common, "-c", str(src), "-o", str(obj)],
+        capture_output=True,
+        text=True,
+    )
     if r.returncode != 0:
         return None, r.stderr.strip().splitlines()[-1] if r.stderr else "compile error"
-    subprocess.run([f"{h}/bin/bisheng", "-fPIC", "-shared", "--cce-fatobj-link",
-                    f"-Wl,-soname,{so.name}", str(obj), "-o", str(so)], check=True)
+        # copy256 moved into its own TU (copy_ref_256_a5.cpp); link it in so that
+    # call_copy256 still resolves from this .so.
+    cobj = obj.with_suffix(".copy.o")
+    subprocess.run(
+        [
+            f"{h}/bin/bisheng",
+            "-xcce",
+            *common,
+            "-c",
+            str(HERE / "copy_ref_256_a5.cpp"),
+            "-o",
+            str(cobj),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            f"{h}/bin/bisheng",
+            "-fPIC",
+            "-shared",
+            "--cce-fatobj-link",
+            f"-Wl,-soname,{so.name}",
+            str(obj),
+            str(cobj),
+            "-o",
+            str(so),
+        ],
+        check=True,
+    )
     lib = ctypes.CDLL(str(so))
     for nm in ("call_hadamard256", "call_copy256"):
-        getattr(lib, nm).argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
+        getattr(lib, nm).argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
         getattr(lib, nm).restype = None
     return lib, None
 
@@ -59,12 +115,16 @@ def main():
     gold = x_np.astype(np.float32) @ H
     goldmax = float(np.abs(gold).max()) or 1.0
 
-    print(f"{'ROWS':>5} {'NBUF':>5} {'had_rel':>10} {'had':>5} {'copy_max|dx|':>13} {'copy':>5}")
+    print(
+        f"{'ROWS':>5} {'NBUF':>5} {'had_rel':>10} {'had':>5} {'copy_max|dx|':>13} {'copy':>5}"
+    )
     for rows in ROWS_LIST:
-        nbuf = nbuf_for(rows); pf = min(2, max(0, nbuf - 1))
+        nbuf = nbuf_for(rows)
+        pf = min(2, max(0, nbuf - 1))
         lib, err = build(rows, nbuf, pf)
         if lib is None:
-            print(f"{rows:>5} {nbuf:>5}   BUILD FAIL: {err}"); continue
+            print(f"{rows:>5} {nbuf:>5}   BUILD FAIL: {err}")
+            continue
         # (a) transform correctness
         x = torch.from_numpy(x_np.copy()).npu()
         lib.call_hadamard256(bd, sp(), ctypes.c_void_p(x.data_ptr()), BATCH)
@@ -80,8 +140,10 @@ def main():
         yout = y.cpu().numpy()
         dcopy = float(np.abs(yout.astype(np.float32) - y_np.astype(np.float32)).max())
         copy_ok = dcopy == 0.0
-        print(f"{rows:>5} {nbuf:>5} {rel:>10.4g} {('OK' if had_ok else 'FAIL'):>5} "
-              f"{dcopy:>13.4g} {('OK' if copy_ok else 'FAIL'):>5}")
+        print(
+            f"{rows:>5} {nbuf:>5} {rel:>10.4g} {('OK' if had_ok else 'FAIL'):>5} "
+            f"{dcopy:>13.4g} {('OK' if copy_ok else 'FAIL'):>5}"
+        )
     print("CHECK256 DONE")
 
 

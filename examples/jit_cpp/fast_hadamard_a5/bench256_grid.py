@@ -21,9 +21,9 @@ N = 256
 h = os.environ.get("ASCEND_HOME_PATH") or os.environ["ASCEND_TOOLKIT_HOME"]
 ROWS_LIST = [16, 32, 64, 128]
 BATCHES = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]  # 2^10..2^18
-COPY_ROWS = 64          # fixed, UB-valid tiling for the copy-floor reference
-POOL = 8                # working set >> L2 to avoid cache-resident (too-fast) copies
-TRIALS = 7              # median over trials rejects timer glitches
+COPY_ROWS = 64  # fixed, UB-valid tiling for the copy-floor reference
+POOL = 8  # working set >> L2 to avoid cache-resident (too-fast) copies
+TRIALS = 7  # median over trials rejects timer glitches
 
 
 def nbuf_for(rows):
@@ -32,20 +32,74 @@ def nbuf_for(rows):
 
 def build(rows, nbuf, pf, tag):
     src = HERE / "fast_hadamard_256_a5.cpp"
-    obj = HERE / f"build/g256_{tag}.o"; so = HERE / f"build/g256_{tag}.so"
+    obj = HERE / f"build/g256_{tag}.o"
+    so = HERE / f"build/g256_{tag}.so"
     (HERE / "build").mkdir(exist_ok=True)
-    common = ["--cce-aicore-arch=dav-c310-vec", "-DREGISTER_BASE", f"-DROWS_PER_TILE={rows}",
-              f"-DNBUF={nbuf}", f"-DPREFETCH={pf}", "-O2", "-std=c++17", "-fPIC",
-              "-Wno-ignored-attributes", "-Wno-macro-redefined",
-              "-mllvm", "-cce-aicore-stack-size=0x8000", "-mllvm", "-cce-aicore-function-stack-size=0x8000",
-              "-mllvm", "-cce-aicore-addr-transform", "-mllvm", "-cce-aicore-dcci-insert-for-scalar=false",
-              "-Xhost-start", "-Xhost-end", f"-I{h}/aarch64-linux/include", f"-I{h}/include"]
-    subprocess.run([f"{h}/bin/bisheng", "-xcce", *common, "-c", str(src), "-o", str(obj)], check=True)
-    subprocess.run([f"{h}/bin/bisheng", "-fPIC", "-shared", "--cce-fatobj-link",
-                    f"-Wl,-soname,{so.name}", str(obj), "-o", str(so)], check=True)
+    common = [
+        "--cce-aicore-arch=dav-c310-vec",
+        "-DREGISTER_BASE",
+        f"-DROWS_PER_TILE={rows}",
+        f"-DNBUF={nbuf}",
+        f"-DPREFETCH={pf}",
+        "-O2",
+        "-std=c++17",
+        "-fPIC",
+        "-Wno-ignored-attributes",
+        "-Wno-macro-redefined",
+        "-mllvm",
+        "-cce-aicore-stack-size=0x8000",
+        "-mllvm",
+        "-cce-aicore-function-stack-size=0x8000",
+        "-mllvm",
+        "-cce-aicore-addr-transform",
+        "-mllvm",
+        "-cce-aicore-dcci-insert-for-scalar=false",
+        "-Xhost-start",
+        "-Xhost-end",
+        f"-I{h}/aarch64-linux/include",
+        f"-I{h}/include",
+    ]
+    subprocess.run(
+        [f"{h}/bin/bisheng", "-xcce", *common, "-c", str(src), "-o", str(obj)],
+        check=True,
+    )
+    # copy256 moved into its own TU (copy_ref_256_a5.cpp); link it in so that
+    # call_copy256 still resolves from this .so.
+    cobj = obj.with_suffix(".copy.o")
+    subprocess.run(
+        [
+            f"{h}/bin/bisheng",
+            "-xcce",
+            *common,
+            "-c",
+            str(HERE / "copy_ref_256_a5.cpp"),
+            "-o",
+            str(cobj),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            f"{h}/bin/bisheng",
+            "-fPIC",
+            "-shared",
+            "--cce-fatobj-link",
+            f"-Wl,-soname,{so.name}",
+            str(obj),
+            str(cobj),
+            "-o",
+            str(so),
+        ],
+        check=True,
+    )
     lib = ctypes.CDLL(str(so))
     for nm in ("call_hadamard256", "call_copy256"):
-        getattr(lib, nm).argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
+        getattr(lib, nm).argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
         getattr(lib, nm).restype = None
     return lib
 
@@ -61,17 +115,23 @@ def gbs_median(fn, bd, batch):
     pool = [torch.randn(batch, N, dtype=torch.float16).npu() for _ in range(POOL)]
     torch.npu.synchronize()
     it = {"k": 0}
+
     def one():
-        b = pool[it["k"] % POOL]; it["k"] += 1
+        b = pool[it["k"] % POOL]
+        it["k"] += 1
         fn(bd, sp(), ctypes.c_void_p(b.data_ptr()), batch)
-    for _ in range(8): one()
+
+    for _ in range(8):
+        one()
     torch.npu.synchronize()
     gs = []
     for _ in range(TRIALS):
         s, e = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
         s.record()
-        for _ in range(r): one()
-        e.record(); torch.npu.synchronize()
+        for _ in range(r):
+            one()
+        e.record()
+        torch.npu.synchronize()
         us = s.elapsed_time(e) * 1e3 / r
         gs.append(data / 1e9 / (us / 1e6))
     del pool
@@ -83,7 +143,9 @@ def main():
     bd = int(sys.argv[1]) if len(sys.argv) > 1 else 64
 
     # ---- fixed copy-floor reference (ROWS=64), measured once per batch ----
-    cref_lib = build(COPY_ROWS, nbuf_for(COPY_ROWS), min(2, nbuf_for(COPY_ROWS) - 1), "copyref")
+    cref_lib = build(
+        COPY_ROWS, nbuf_for(COPY_ROWS), min(2, nbuf_for(COPY_ROWS) - 1), "copyref"
+    )
     copy_ref = {}
     for batch in BATCHES:
         copy_ref[batch] = gbs_median(cref_lib.call_copy256, bd, batch)
@@ -91,7 +153,8 @@ def main():
     print("rows,nbuf,batch,had_gbs,copy_gbs,ratio")
     out = ["rows,nbuf,batch,had_gbs,copy_gbs,ratio"]
     for rows in ROWS_LIST:
-        nbuf = nbuf_for(rows); pf = min(2, max(0, nbuf - 1))
+        nbuf = nbuf_for(rows)
+        pf = min(2, max(0, nbuf - 1))
         lib = build(rows, nbuf, pf, str(rows))
         for batch in BATCHES:
             if batch % rows != 0:
@@ -99,9 +162,13 @@ def main():
             hg = gbs_median(lib.call_hadamard256, bd, batch)
             cg = copy_ref[batch]
             line = f"{rows},{nbuf},{batch},{hg:.1f},{cg:.1f},{hg/cg:.4f}"
-            print(line); sys.stdout.flush(); out.append(line)
+            print(line)
+            sys.stdout.flush()
+            out.append(line)
     (HERE / "build/grid256.csv").write_text("\n".join(out) + "\n")
-    print(f"# copy-floor peak = {max(copy_ref.values()):.1f} GB/s (should be < ~3300 = HBM ceiling)")
+    print(
+        f"# copy-floor peak = {max(copy_ref.values()):.1f} GB/s (should be < ~3300 = HBM ceiling)"
+    )
     print("GRID256 DONE")
 
 

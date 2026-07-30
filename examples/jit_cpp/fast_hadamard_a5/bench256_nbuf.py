@@ -13,9 +13,12 @@ import numpy as np, torch, torch_npu  # noqa
 HERE = Path(__file__).resolve().parent
 N = 256
 h = os.environ.get("ASCEND_HOME_PATH") or os.environ["ASCEND_TOOLKIT_HOME"]
-UB_BUDGET = 248 * 1024                      # A5 physical UB per docs
+UB_BUDGET = 248 * 1024  # A5 physical UB per docs
 ROWS_LIST = [32, 64]
-NBUF_LIST = [2, 4]  # NBUF>=6 device-faults (507035): the per-buffer event-ID reuse tops out ~4 outstanding
+NBUF_LIST = [
+    2,
+    4,
+]  # NBUF>=6 device-faults (507035): the per-buffer event-ID reuse tops out ~4 outstanding
 BATCHES = [4096, 16384, 65536, 262144]
 TRIALS = 7
 
@@ -27,20 +30,75 @@ def aln512(b):
 def build(rows, nbuf, prefetch):
     tag = f"{rows}_{nbuf}"
     src = HERE / "fast_hadamard_256_a5.cpp"
-    obj = HERE / f"build/nb256_{tag}.o"; so = HERE / f"build/nb256_{tag}.so"
+    obj = HERE / f"build/nb256_{tag}.o"
+    so = HERE / f"build/nb256_{tag}.so"
     (HERE / "build").mkdir(exist_ok=True)
-    common = ["--cce-aicore-arch=dav-c310-vec", "-DREGISTER_BASE", f"-DROWS_PER_TILE={rows}",
-              f"-DNBUF={nbuf}", f"-DPREFETCH={prefetch}", f"-DUB_USABLE_BYTES={UB_BUDGET}",
-              "-O2", "-std=c++17", "-fPIC", "-Wno-ignored-attributes", "-Wno-macro-redefined",
-              "-mllvm", "-cce-aicore-stack-size=0x8000", "-mllvm", "-cce-aicore-function-stack-size=0x8000",
-              "-mllvm", "-cce-aicore-addr-transform", "-mllvm", "-cce-aicore-dcci-insert-for-scalar=false",
-              "-Xhost-start", "-Xhost-end", f"-I{h}/aarch64-linux/include", f"-I{h}/include"]
-    subprocess.run([f"{h}/bin/bisheng", "-xcce", *common, "-c", str(src), "-o", str(obj)], check=True)
-    subprocess.run([f"{h}/bin/bisheng", "-fPIC", "-shared", "--cce-fatobj-link",
-                    f"-Wl,-soname,{so.name}", str(obj), "-o", str(so)], check=True)
+    common = [
+        "--cce-aicore-arch=dav-c310-vec",
+        "-DREGISTER_BASE",
+        f"-DROWS_PER_TILE={rows}",
+        f"-DNBUF={nbuf}",
+        f"-DPREFETCH={prefetch}",
+        f"-DUB_USABLE_BYTES={UB_BUDGET}",
+        "-O2",
+        "-std=c++17",
+        "-fPIC",
+        "-Wno-ignored-attributes",
+        "-Wno-macro-redefined",
+        "-mllvm",
+        "-cce-aicore-stack-size=0x8000",
+        "-mllvm",
+        "-cce-aicore-function-stack-size=0x8000",
+        "-mllvm",
+        "-cce-aicore-addr-transform",
+        "-mllvm",
+        "-cce-aicore-dcci-insert-for-scalar=false",
+        "-Xhost-start",
+        "-Xhost-end",
+        f"-I{h}/aarch64-linux/include",
+        f"-I{h}/include",
+    ]
+    subprocess.run(
+        [f"{h}/bin/bisheng", "-xcce", *common, "-c", str(src), "-o", str(obj)],
+        check=True,
+    )
+    # copy256 moved into its own TU (copy_ref_256_a5.cpp); link it in so that
+    # call_copy256 still resolves from this .so.
+    cobj = obj.with_suffix(".copy.o")
+    subprocess.run(
+        [
+            f"{h}/bin/bisheng",
+            "-xcce",
+            *common,
+            "-c",
+            str(HERE / "copy_ref_256_a5.cpp"),
+            "-o",
+            str(cobj),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            f"{h}/bin/bisheng",
+            "-fPIC",
+            "-shared",
+            "--cce-fatobj-link",
+            f"-Wl,-soname,{so.name}",
+            str(obj),
+            str(cobj),
+            "-o",
+            str(so),
+        ],
+        check=True,
+    )
     lib = ctypes.CDLL(str(so))
     for nm in ("call_hadamard256", "call_copy256"):
-        getattr(lib, nm).argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
+        getattr(lib, nm).argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
         getattr(lib, nm).restype = None
     return lib
 
@@ -72,17 +130,23 @@ def gbs_median(fn, bd, batch):
     pool = [torch.randn(batch, N, dtype=torch.float16).npu() for _ in range(8)]
     torch.npu.synchronize()
     it = {"k": 0}
+
     def one():
-        b = pool[it["k"] % 8]; it["k"] += 1
+        b = pool[it["k"] % 8]
+        it["k"] += 1
         fn(bd, sp(), ctypes.c_void_p(b.data_ptr()), batch)
-    for _ in range(8): one()
+
+    for _ in range(8):
+        one()
     torch.npu.synchronize()
     samples = []
     for _ in range(TRIALS):
         s, e = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
         s.record()
-        for _ in range(50): one()
-        e.record(); torch.npu.synchronize()
+        for _ in range(50):
+            one()
+        e.record()
+        torch.npu.synchronize()
         samples.append(data / 1e9 / (s.elapsed_time(e) * 1e3 / 50 / 1e6))
     del pool
     samples.sort()
@@ -91,8 +155,11 @@ def gbs_median(fn, bd, batch):
 
 def main():
     bd = int(sys.argv[1]) if len(sys.argv) > 1 else 64
-    header = f"{'ROWS':>4} {'NBUF':>4} {'PF':>3} {'UB_KB':>6} {'rel':>9} {'ok':>3}  " + \
-             "  ".join(f"{b//1024}k" if b >= 1024 else str(b) for b in BATCHES) + "  (GB/s)"
+    header = (
+        f"{'ROWS':>4} {'NBUF':>4} {'PF':>3} {'UB_KB':>6} {'rel':>9} {'ok':>3}  "
+        + "  ".join(f"{b//1024}k" if b >= 1024 else str(b) for b in BATCHES)
+        + "  (GB/s)"
+    )
     print(header)
     for rows in ROWS_LIST:
         tile = aln512(rows * N * 2)
@@ -105,8 +172,10 @@ def main():
             ok = "OK" if rel < 0.03 else "FAIL"
             gbs = [gbs_median(lib.call_hadamard256, bd, b) for b in BATCHES]
             ub_kb = nbuf * tile // 1024
-            print(f"{rows:>4} {nbuf:>4} {prefetch:>3} {ub_kb:>6} {rel:>9.4g} {ok:>3}  " +
-                  "  ".join(f"{g:>6.0f}" for g in gbs))
+            print(
+                f"{rows:>4} {nbuf:>4} {prefetch:>3} {ub_kb:>6} {rel:>9.4g} {ok:>3}  "
+                + "  ".join(f"{g:>6.0f}" for g in gbs)
+            )
             sys.stdout.flush()
     print("NBUF SWEEP DONE")
 
