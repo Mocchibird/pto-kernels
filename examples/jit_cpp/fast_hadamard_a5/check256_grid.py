@@ -62,7 +62,7 @@ def build(rows, nbuf, pf):
     )
     if r.returncode != 0:
         return None, r.stderr.strip().splitlines()[-1] if r.stderr else "compile error"
-        # copy256 moved into its own TU (copy_ref_256_a5.cpp); link it in so that
+    # copy256 moved into its own TU (copy_ref_256_a5.cpp); link it in so that
     # call_copy256 still resolves from this .so.
     cobj = obj.with_suffix(".copy.o")
     subprocess.run(
