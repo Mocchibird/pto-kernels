@@ -6,6 +6,50 @@ open question in section 7, not a settled number. -->
 
 # MXFP4 Quantization on Ascend 950 / A5 (dav-c310-vec) — Implementation Plan
 
+> ## Read this first — the repo moved under this plan (2026-08-04)
+>
+> Drafted 2026-07-29 against the Hadamard work-in-progress. That work has since been
+> cleaned up, re-measured and **merged upstream as `3872ecb`**. The *research* below
+> (R1/R2/R3/R5, the format facts, the ISA survey) still stands. The *repo
+> assumptions* do not.
+>
+> **File layout.** `fast_hadamard_256_a5.cpp` → `fast_hadamard_a5.cpp`;
+> `jit_util_hadamard256_a5.py` + `jit_util_copy256_a5.py` → one `jit_util_a5.py`;
+> `copy_ref_256_a5.cpp`, `__init__.py` and both plot scripts are **deleted** (plots
+> live in the companion `pto-kernels-plots` repo). Every `file.cpp:line` citation
+> here points at code that no longer exists in that shape — the kernel is now
+> templated on `<N, Rows, Buffers, Prefetch>` with **zero `#define`s**.
+>
+> **Defects already fixed — do not re-fix.** D6 (degenerate 2-buffer pipeline), D9
+> (`static_assert` guarding the wrong quantity), D11 (`__init__.py` breaking pytest)
+> and D12 (unsafe artifact cache key) are all resolved in the merged version. D13
+> (`__global__` body inside `#ifdef __DAV_VEC__`) is **deliberate and must stay**:
+> guarding the *definition* instead turns the kernel into a silent no-op that
+> returns its input unchanged with plausible timings.
+>
+> **Do not build `copy_ref_mxfp4_a5.cpp`.** The hand-written DMA-floor twin this plan
+> specifies is the single approach that cost the most time on the Hadamard kernel: it
+> read 2764–3660 GB/s (33% spread) and was partly cache-fed, so every ratio taken
+> against it flattered the kernel. Use a **torch device-to-device copy** of the same
+> byte count instead — it measured 3023–3025 GB/s, a 0.08% spread, across every shape.
+>
+> **Corrected constants and baselines.**
+> - UB on A5 is **256 KB** (`PTO_UBUF_SIZE_BYTES`), not the 192 KB assumed here;
+>   192 KB is A2/A3.
+> - The GM↔UB tile is **16 KB** (a measured optimum at every N), not 32 KB, with
+>   `ROWS_PER_TILE = 8192/N`. `NBUF=4` / `PREFETCH=2` still hold.
+> - The Hadamard reference point is **2.83 TB/s = 0.935 of a torch copy at N=256**
+>   (0.87–0.95 across N=32…2048), not "2.70 TB/s / 94% of copy".
+>
+> **Measurement rules learned since.** Median **whole script invocations**, not just
+> in-process reps: one invocation moves a cell by up to 3.5 points, and a single pass
+> reads systematically high (7 of 7 block sizes). And verify the harness's own
+> invariants at the extremes of a sweep — a `POOL_MAX` clamp silently let the working
+> set grow 8→256 MB across a batch sweep and manufactured a cache-knee kink.
+>
+> **New upstream convention.** `.skills/testing-pto-kernels/SKILL.md` now ships in the
+> repo with a "Definition Of Done" for PTO kernel work. Follow it.
+
 **Repo root:** `/Users/hyunmin/Projects/Work/Huawei/pto-kernels`
 **New directories this plan creates:**
 
