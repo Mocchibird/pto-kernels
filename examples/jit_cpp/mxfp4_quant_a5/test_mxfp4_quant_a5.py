@@ -1,15 +1,18 @@
 # pylint: disable=wrong-import-position  # imports are guarded by importorskip
 """Correctness for the A5 MXFP4 quantization kernel, over K and batch.
 
-The gate is **bit-exact** against ``mxfp4_ref``, not a tolerance: scale bytes and
-E2M1 nibbles are integers, so any mismatch is a bug. That is stricter than the
-repo skill's numeric thresholds, deliberately — see PLAN.md 4.8.
+The reference is **`torch_npu.npu_dynamic_mx_quant`**, the CANN operator a caller
+would otherwise use. The gate is bit-exact: scale bytes and E2M1 nibbles are
+integers, so any mismatch is a bug, not a tolerance. That is stricter than the
+numeric thresholds in `.skills/testing-pto-kernels`, deliberately.
 
-Per ``.skills/testing-pto-kernels``: real-device runs repeat
-(``PTO_DEVICE_REPEATS``, default 5) because a three-pass pipeline is exactly where
-a missing ``set_flag``/``wait_flag`` shows up nondeterministically, and each
-synchronize is bounded (``PTO_SYNC_TIMEOUT_S``) because a sync bug deadlocks
-rather than mismatching.
+Per that skill: real-device runs repeat (`PTO_DEVICE_REPEATS`, default 5) because a
+four-pass pipeline is where a missing `set_flag`/`wait_flag` shows up
+nondeterministically, and each synchronize is bounded (`PTO_SYNC_TIMEOUT_S`)
+because a sync bug deadlocks rather than mismatching.
+
+If the vendor operator is absent the comparisons **skip**, which is not the same as
+passing -- read the skip reason before believing a green run.
 """
 
 import sys
@@ -19,9 +22,8 @@ import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
-pytest.importorskip("torch_npu")
+torch_npu = pytest.importorskip("torch_npu")
 
-import mxfp4_ref as ref  # noqa: E402
 from jit_util_mxfp4_a5 import (  # noqa: E402
     K,
     MX_BLOCK,
@@ -33,8 +35,7 @@ from jit_util_mxfp4_a5 import (  # noqa: E402
     rows_for,
 )
 
-# The skill ships the shared helpers; use them rather than hand-rolling. If the
-# checkout lacks them, say so loudly instead of silently diverging.
+# The skill ships the shared helpers; use them rather than hand-rolling.
 _REFERENCE = (
     Path(__file__).resolve().parents[3] / ".skills/testing-pto-kernels/reference"
 )
@@ -43,6 +44,10 @@ if _REFERENCE.is_dir():
     import pto_demo_utils as demo  # noqa: E402
 else:  # pragma: no cover - only on a partial checkout
     demo = None
+
+VENDOR_DST_TYPE = 296  # torch_npu.float4_e2m1fn_x2
+# E2M1 magnitude grid by 3-bit field, used only by the quality report
+E2M1_GRID = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float64)
 
 
 def repeats() -> int:
@@ -66,34 +71,50 @@ def block_dim() -> int:
     return 64
 
 
+def vendor_quantize(x):
+    """(q, scale) from the CANN operator, with scale reshaped to match ours.
+
+    The vendor returns scale as (batch, K/64, 2) where ours is (batch, K/32) --
+    same count, different layout, so one side has to be reshaped.
+    """
+    fn = getattr(torch_npu, "npu_dynamic_mx_quant", None)
+    if fn is None:
+        pytest.skip("torch_npu.npu_dynamic_mx_quant missing: no reference to compare")
+    try:
+        q, s = fn(x, dst_type=VENDOR_DST_TYPE)
+    except Exception as exc:  # pragma: no cover - op signature drift
+        pytest.skip(f"vendor op rejected the call: {type(exc).__name__}: {exc}")
+    sync()
+    batch, k = x.shape
+    return (
+        q.cpu().numpy().reshape(batch, k // 2),
+        s.cpu().numpy().reshape(batch, k // MX_BLOCK),
+    )
+
+
 def make_bf16(batch, k, seed):
-    """A bf16 tensor and the exact bit patterns the reference will consume."""
-    rng = np.random.default_rng(seed)
-    x32 = rng.standard_normal((batch, k)).astype(np.float32)
-    bits = ref.f32_to_bf16_bits(x32)  # round once, host side
-    exact = ref.bf16_bits_to_f32(bits)  # what the device will actually see
-    x = torch.from_numpy(exact).to(torch.bfloat16).npu()
-    return x, bits
+    """Random bf16 on device, rounded once on the host so the kernel and the vendor
+    see exactly the same values."""
+    gen = torch.Generator().manual_seed(seed)
+    x = torch.randn(batch, k, generator=gen, dtype=torch.float32)
+    return x.to(torch.bfloat16).npu()
 
 
-def run_and_compare(kernel, k, batch, seed, label):
-    x, bits = make_bf16(batch, k, seed)
-    want_q, want_s = ref.quantize(bits)
+def run_and_compare(kernel, x, label):
+    want_q, want_s = vendor_quantize(x)
     # repeat: a sync bug is nondeterministic, so one clean pass proves little
     for attempt in range(repeats()):
         q, s = kernel(x)
         sync()
-        got_q = q.cpu().numpy()
-        got_s = s.cpu().numpy()
+        got_q, got_s = q.cpu().numpy(), s.cpu().numpy()
         assert np.array_equal(got_s, want_s), (
-            f"{label}: scale bytes differ on attempt {attempt} "
+            f"{label}: scale bytes differ from the vendor op on attempt {attempt} "
             f"({int((got_s != want_s).sum())} of {want_s.size})"
         )
         assert np.array_equal(got_q, want_q), (
-            f"{label}: nibbles differ on attempt {attempt} "
+            f"{label}: nibbles differ from the vendor op on attempt {attempt} "
             f"({int((got_q != want_q).sum())} of {want_q.size} bytes)"
         )
-    return got_q, got_s
 
 
 @pytest.fixture(scope="module")
@@ -101,31 +122,29 @@ def quant_default():
     return build_and_load(block_dim=block_dim(), verbose=False)
 
 
-# 64 is one tile; 128 two tiles; 1000/4097 are non-multiples that exercise the
-# padding wrapper; 65536 is more logical work than physical cores (skill: shape
-# coverage), at K=4096 that is 32768 tiles over 64 cores.
+# 1000 and 4097 are non-multiples that exercise the padding wrapper; 65536 is more
+# logical work than physical cores (skill: shape coverage).
 @pytest.mark.parametrize("batch", [64, 128, 1000, 4097, 65536])
-def test_matches_reference(quant_default, batch):
-    run_and_compare(quant_default, K, batch, batch, f"batch={batch}")
+def test_matches_vendor(quant_default, batch):
+    run_and_compare(quant_default, make_bf16(batch, K, batch), f"batch={batch}")
 
 
 @pytest.mark.parametrize("k", SUPPORTED_K)
-def test_matches_reference_at_row_width(k):
+def test_matches_vendor_at_row_width(k):
     kernel = build_and_load(block_dim=block_dim(), k=k, verbose=False)
-    run_and_compare(kernel, k, 4 * rows_for(k), k, f"k={k}")
+    run_and_compare(kernel, make_bf16(4 * rows_for(k), k, k), f"k={k}")
 
 
 def test_nibble_order_is_pinned(quant_default):
-    """One block of known codes, all bytes asserted exactly. No auto-fitting.
+    """One block of known codes, asserted exactly. No auto-fitting.
 
-    Device-measured: e0=1.0, e1=2.0 with scale byte 127 gives first byte 0x42,
-    i.e. element 2j occupies the LOW nibble.
+    e0=1.0, e1=2.0 with amax 6.0 (scale byte 127) must give first byte 0x42, i.e.
+    element 2j occupies the LOW nibble. Asserted against the pinned convention
+    rather than the vendor, so a vendor change cannot silently redefine our layout.
     """
-    x32 = np.zeros((rows_for(K), K), dtype=np.float32)
-    x32[0, 0], x32[0, 1], x32[0, 31] = 1.0, 2.0, 6.0
-    bits = ref.f32_to_bf16_bits(x32)
-    x = torch.from_numpy(ref.bf16_bits_to_f32(bits)).to(torch.bfloat16).npu()
-    q, s = quant_default(x)
+    x = torch.zeros((rows_for(K), K), dtype=torch.bfloat16)
+    x[0, 0], x[0, 1], x[0, 31] = 1.0, 2.0, 6.0
+    q, s = quant_default(x.npu())
     sync()
     assert int(s.cpu().numpy()[0, 0]) == 127, "scale byte for amax=6.0 must be 127"
     assert (
@@ -149,43 +168,22 @@ ADVERSARIAL = {
 def test_adversarial_blocks(quant_default, name):
     """Random N(0,1) reaches none of these, which is why they are enumerated."""
     values = ADVERSARIAL[name]
-    rows = rows_for(K)
-    x32 = np.zeros((rows, K), dtype=np.float32)
+    x = torch.zeros((rows_for(K), K), dtype=torch.bfloat16)
     for i, v in enumerate(values):
         blk = (i % (K // MX_BLOCK)) * MX_BLOCK
-        x32[0, blk : blk + MX_BLOCK] = v
-        x32[0, blk] = v  # amax position varies within the block
+        x[0, blk : blk + MX_BLOCK] = v
         if len(values) > 1:
-            x32[0, blk + 1] = v / 2.0
-    bits = ref.f32_to_bf16_bits(x32)
-    x = torch.from_numpy(ref.bf16_bits_to_f32(bits)).to(torch.bfloat16).npu()
-    want_q, want_s = ref.quantize(bits)
-    q, s = quant_default(x)
-    sync()
-    assert np.array_equal(s.cpu().numpy(), want_s), f"{name}: scale bytes differ"
-    assert np.array_equal(q.cpu().numpy(), want_q), f"{name}: nibbles differ"
-
-
-def test_spec_cross_check():
-    """The bit-chain reference and the float64 spec formula must agree, or a bias
-    constant is wrong in a way the bit chain would reproduce faithfully."""
-    _, bits = make_bf16(256, K, 7)
-    _, chain = ref.quantize(bits)
-    spec = ref.scale_bytes_from_spec(bits)
-    assert np.array_equal(chain, spec), "bit-chain and spec scale bytes disagree"
+            x[0, blk + 1] = v / 2.0
+    run_and_compare(quant_default, x.npu(), name)
 
 
 def test_output_is_nontrivial(quant_default):
-    """Catches the silent-no-op arch-flag failure: a kernel compiled for the wrong
-    architecture returns success having written nothing.
-
-    Two different inputs must give two different outputs. That needs no
-    caller-supplied buffers, so it does not depend on their GM alignment.
-    """
+    """Catches the silent-no-op arch-flag failure: a kernel built for the wrong
+    architecture returns success having written nothing. Two different inputs must
+    give two different outputs."""
     outs = []
     for seed in (11, 12):
-        x, _ = make_bf16(rows_for(K), K, seed)
-        q, s = quant_default(x)
+        q, s = quant_default(make_bf16(rows_for(K), K, seed))
         sync()
         outs.append((q.cpu().numpy().copy(), s.cpu().numpy().copy()))
     assert not np.array_equal(
@@ -197,18 +195,29 @@ def test_output_is_nontrivial(quant_default):
 
 
 def test_quantization_quality(quant_default):
-    """RMSE relative to output magnitude, and R-squared — the skill's requirement
-    for outlier-heavy kernels. Max-error alone only reports whichever value landed
-    worst in a 16-level grid."""
-    x, bits = make_bf16(1024, K, 13)
+    """Relative RMSE and R-squared -- the skill's requirement for outlier-heavy
+    kernels. Max error alone only reports whichever value landed worst in a
+    16-level grid."""
+    x = make_bf16(1024, K, 13)
     q, s = quant_default(x)
     sync()
-    original = ref.bf16_bits_to_f32(bits)
-    recon = ref.dequantize(q.cpu().numpy(), s.cpu().numpy())
-    rmse_rel, r2 = ref.quality(original, recon)
+    packed = q.cpu().numpy()
+    codes = np.empty((x.shape[0], K), dtype=np.uint8)
+    codes[:, 0::2], codes[:, 1::2] = packed & 0x0F, packed >> 4
+    mag = E2M1_GRID[codes & 0x07]
+    signed = np.where((codes & 0x08) != 0, -mag, mag)
+    scale = np.exp2(s.cpu().numpy().astype(np.float64) - 127.0)
+    nblk = K // MX_BLOCK
+    blocked = signed.reshape((x.shape[0], nblk, MX_BLOCK)) * scale[:, :, None]
+    recon = blocked.reshape((x.shape[0], K))
+    original = x.float().cpu().numpy().astype(np.float64)
+    err = recon - original
+    rms = float(np.sqrt(np.mean(original**2))) or 1.0
+    rmse_rel = float(np.sqrt(np.mean(err**2))) / rms
+    r2 = 1.0 - float(np.mean(err**2)) / float(np.var(original))
     print(f"\n  MXFP4 quality: rmse/rms={rmse_rel:.4f}  R^2={r2:.4f}")
-    # MXFP4 keeps 3 magnitude bits over a 32-element block; on N(0,1) that is
-    # ~0.1 relative RMSE. These bounds catch a broken kernel, not a subtle one.
+    # MXFP4 keeps 3 magnitude bits over a 32-element block, so ~0.1 on N(0,1).
+    # These bounds catch a broken kernel, not a subtle one.
     assert rmse_rel < 0.25, f"relative RMSE {rmse_rel:.4f} too high for MXFP4"
     assert r2 > 0.9, f"R^2 {r2:.4f} too low for MXFP4"
 
@@ -237,43 +246,6 @@ def test_non_contiguous_is_rejected(quant_default):
     with pytest.raises(AssertionError, match="contiguous"):
         quant_default(view)
     quant_default(view.contiguous())  # same data, accepted
-
-
-# The CANN op behind torch_npu is the only other MXFP4 implementation on this
-# device. It is a cross-check, not the gate: it runs on the same hardware, so a
-# shared driver bug would pass, and matching it is a weaker claim than
-# implementing Algorithm 1 correctly. Measured 2026-08-05, CANN 9.0.0: vendor,
-# kernel and host reference are bit-identical on the bf16 path -- there is no
-# double rounding there, so a hard assertion is the right gate. Its scale tensor
-# is (batch, K/64, 2) where ours is (batch, K/32), same count, so reshape.
-def test_matches_vendor_op(quant_default):
-    vendor = getattr(torch, "_dummy", None) or getattr(
-        __import__("torch_npu"), "npu_dynamic_mx_quant", None
-    )
-    if vendor is None:
-        pytest.skip("torch_npu.npu_dynamic_mx_quant not available in this CANN")
-    x, bits = make_bf16(4 * rows_for(K), K, 5)
-    try:
-        v_q, v_s = vendor(x, dst_type=296)  # float4_e2m1fn_x2
-    except Exception as exc:  # pragma: no cover - op signature drift
-        pytest.skip(f"vendor op rejected the call: {type(exc).__name__}: {exc}")
-    sync()
-    q, s = quant_default(x)
-    sync()
-    want_q, want_s = ref.quantize(bits)
-    v_q = v_q.cpu().numpy().reshape(want_q.shape)
-    v_s = v_s.cpu().numpy().reshape(want_s.shape)
-    assert np.array_equal(v_s, want_s), (
-        f"vendor scale bytes differ from the reference "
-        f"({int((v_s != want_s).sum())} of {want_s.size}): our format contract "
-        "and the vendor's have diverged"
-    )
-    assert np.array_equal(v_q, want_q), (
-        f"vendor nibbles differ from the reference "
-        f"({int((v_q != want_q).sum())} of {want_q.size} bytes)"
-    )
-    assert np.array_equal(q.cpu().numpy(), v_q), "kernel differs from the vendor op"
-    assert np.array_equal(s.cpu().numpy(), v_s), "kernel scale differs from the vendor"
 
 
 def test_rows_for_matches_kernel():

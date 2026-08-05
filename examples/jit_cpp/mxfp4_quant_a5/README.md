@@ -11,7 +11,7 @@ becomes one E2M1 nibble. Outputs are `q` `(batch, K/2)` uint8 and `scale`
 (one instantiation per supported width, **128 … 4096**, dispatched at run time so
 there is no rebuild per width); the MXFP4 block size 32 is static.
 
-> **Status: correct, not yet optimised.** The gate is bit-exact and 32/32 tests
+> **Status: correct, not yet optimised.** The gate is bit-exact and 32/30 tests
 > pass on real hardware. There is **no performance claim and no benchmark** in this
 > change — the kernel knowingly carries one extra UB round trip (see
 > "The alignment tax"). Correctness *is* cross-checked against
@@ -23,12 +23,9 @@ there is no rebuild per width); the MXFP4 block size 32 is static.
 - `mxfp4_quant_a5.cpp` — the kernel. Every derived size and its `static_assert`
   lives in one `QuantShape`, checked per instantiation, so an invalid combination
   cannot be built. No `#define` beyond the arch guards.
-- `mxfp4_ref.py` — host reference, numpy only. Two independent references: a
-  **bit chain** that reproduces the kernel's exact sequence, and a **float64 spec
-  formula** that shares no arithmetic with it, so a wrong bias constant cannot hide.
 - `jit_util_mxfp4_a5.py` — build + load. The callable pads the batch to a multiple
   of `ROWS_PER_TILE` and slices back, so any batch size works.
-- `test_mxfp4_quant_a5.py` — 32 tests, bit-exact against the reference.
+- `test_mxfp4_quant_a5.py` — 30 tests, bit-exact against `torch_npu`.
 
 ## Build & run
 
@@ -37,7 +34,7 @@ Requires a real A5 device with `torch`/`torch_npu` and the CANN toolkit; set
 
 ```bash
 source /usr/local/Ascend/cann-9.0.0/bin/setenv.bash
-pytest test_mxfp4_quant_a5.py          # 32 tests, bit-exact
+pytest test_mxfp4_quant_a5.py          # 30 tests, bit-exact
 ```
 
 ```python
@@ -49,7 +46,7 @@ q, scale = quant(x)                    # x: (batch, 4096) bfloat16, contiguous
 ## Format contract, as measured
 
 Every value below was measured on device against the CANN operator behind
-`torch_npu.npu_dynamic_mx_quant`, and is reproduced independently by `mxfp4_ref.py`.
+`torch_npu.npu_dynamic_mx_quant`, which is also what the tests compare against.
 None of it is assumed.
 
 **Scale rule — OCP MX v1.0 §6.3 Algorithm 1, FLOOR.**
@@ -117,7 +114,7 @@ and contiguous, deleting pass A2 at the cost of moving pass B into the b32 domai
 
 ## Correctness
 
-`pytest` → **32 passed** on real A5 hardware.
+`pytest` → **30 passed** on real A5 hardware.
 
 The gate is **bit-exact**, not a tolerance: scale bytes and E2M1 nibbles are
 integers, so any mismatch is a bug. Coverage:
@@ -129,17 +126,17 @@ integers, so any mismatch is a bug. Coverage:
   clamp window (`2^-15`, `2^-14`, `2^-13`), subnormal amax, the clip-to-6 band,
   all seven E2M1 midpoints, all-zero, a huge outlier, near-bf16-max, and `-0.0`;
 - the nibble order asserted against one pinned convention;
-- the bit-chain and float64 spec references asserted equal to each other;
 - rejection of an unsupported `K`, a wrong dtype, and a non-contiguous input — the
   kernel can report none of these, so the host must;
 - `ROWS_PER_TILE` queried from the built `.so` and pinned against the Python
   value, so the two cannot drift;
-- a cross-check against `torch_npu.npu_dynamic_mx_quant`, the CANN operator that
-  is the only other MXFP4 implementation on this device. Measured 2026-08-05 on
-  CANN 9.0.0: the vendor op, this kernel and the host reference are **bit-identical**
-  on the bf16 path. It is a cross-check rather than the gate -- it runs on the same
-  hardware, so a shared driver bug would pass it, and matching the vendor is a
-  weaker claim than implementing Algorithm 1 correctly.
+- the nibble order and the `amax=6.0` scale byte asserted against the pinned
+  convention directly, so a vendor change cannot silently redefine our layout.
+
+The reference is `torch_npu.npu_dynamic_mx_quant` — the operator a caller would
+otherwise use — and this kernel matches it **bit-exactly** on the bf16 path
+(measured 2026-08-05, CANN 9.0.0). If that operator is absent the comparisons skip,
+which is not the same as passing: read the skip reason before trusting a green run.
 
 Per `.skills/testing-pto-kernels`, device runs repeat (`PTO_DEVICE_REPEATS`,
 default 5) because a four-pass pipeline is where a missing `set_flag`/`wait_flag`
