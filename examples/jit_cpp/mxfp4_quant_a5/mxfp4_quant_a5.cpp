@@ -1,21 +1,18 @@
 // mxfp4_quant_a5 — MXFP4 block quantization on the Ascend A5 (dav-c310).
 //
-// Quantizes a (batch, K) bf16 matrix to OCP MXFP4: each consecutive run of 32
-// elements shares one E8M0 scale byte, and each element becomes one E2M1
-// nibble. Outputs q (batch, K/2) uint8 and scale (batch, K/32) uint8.
+// (batch, K) bf16 -> q (batch, K/2) uint8 + scale (batch, K/32) uint8. Every 32
+// elements share one E8M0 byte; each element becomes one E2M1 nibble.
 //
-// Scale rule is OCP MX v1.0 §6.3 Algorithm 1 (FLOOR), device-measured:
-//   byte = floor(log2(amax)) + 125 = b - 2,  b = biased exponent of |amax|
-//   1/X  = the bf16 whose exponent field is 256 - b, mantissa 0
-// Both come from the same clamped b, so they stay exact inverses. FLOOR puts
-// amax/X in [4,8) while E2M1 tops out at 6.0, so a block's largest element can
-// clip to 6 — that is Algorithm 1 as specified, and the cast saturates on its
-// own, so there is no clipping code and no set_ctrl.
+// Scale rule: OCP MX v1.0 §6.3 Algorithm 1 (FLOOR). byte = b - 2 and 1/X has
+// exponent field 256 - b, both from the same clamped b so they stay exact
+// inverses. The cast saturates at ±6 on its own: no clipping code, no set_ctrl.
 //
-// Three passes over a UB tile, because each has a different natural width:
-// A reduces 32-element blocks to maxima, B turns maxima into scale bytes and
-// reciprocals, C scales/casts/packs. README.md has the rationale and the
-// measured format facts.
+// Four passes: A reduces blocks to maxima, A2 compacts them (see VSTS_ALIGN),
+// B derives scale bytes and reciprocals, C scales/casts/packs.
+//
+// Every non-obvious constraint below was measured, not assumed. The evidence --
+// probe output, A/B runs, and what the wrong version looked like -- is in
+// MXFP4_A5_FINDINGS.md.
 #include <pto/pto-inst.hpp>
 #include <utility>
 using namespace pto;
@@ -29,11 +26,8 @@ constexpr unsigned MX_BLOCK = 32;    // MXFP4 block: 32 elements, one E8M0 scale
 constexpr unsigned DEF_BUFFERS = 4;  // UB buffers in the GM<->UB pipeline
 constexpr unsigned DEF_PREFETCH = 2;  // tiles in flight ahead of the compute
 
-// Elements per GM<->UB tile: a 16 KB bf16 tile, the size the sibling
-// fast_hadamard_a5 measured fastest. Pass B consumes 128 maxima at a time, so a
-// tile must hold a whole multiple of 128 blocks == 4096 elements; RowsFor keeps
-// the product on that grid. Must agree with rows_for() in jit_util_mxfp4_a5.py,
-// which needs it before any .so exists; test_rows_for_matches_kernel pins them.
+// 16 KB bf16 tile, the size fast_hadamard_a5 measured fastest. Must agree with
+// rows_for() in jit_util_mxfp4_a5.py; test_rows_for_matches_kernel pins them.
 constexpr unsigned TILE_ELEMS = 8192;
 constexpr unsigned PASS_B_GRAIN = 4096;  // 128 blocks of 32
 template <unsigned K>
@@ -44,18 +38,20 @@ struct RowsFor {
 
 #ifdef __CCE_AICORE__
 constexpr unsigned B16_LANES = 128;  // bf16 lanes in one vector register
-// device-measured, see pass A: vcgmax on b16 reduces 16-lane groups, 8 results
+// MEASURED: vcgmax on b16 reduces 16-lane groups and returns 8 results in lanes
+// 0..7. The 8 in CANN's TQuant.hpp is the b32 group; it does not carry over.
 constexpr unsigned VCGMAX_B16_GROUP = 16;
 constexpr unsigned VCGMAX_B16_RESULTS = B16_LANES / VCGMAX_B16_GROUP;
 static_assert(VCGMAX_B16_RESULTS == 8, "pass A stores with PAT_VL8");
-// vsts needs a 32-byte-aligned UB address (a 16-byte store size at one is
-// fine, but a 16-byte-aligned address faults the vector core with 507035).
-// Eight b16 results are only 16 bytes, so pad each group to a 32-byte pitch.
+// RULE: vsts needs a 32-byte-aligned UB address or the vector core faults with
+// 507035. Eight b16 results are 16 bytes, so groups get a 32-byte pitch and
+// pass A2 squeezes the holes out. Tile also refuses a sub-32-byte DMA, so the
+// padding cannot instead be skipped on the GM side.
 constexpr unsigned VSTS_ALIGN = 32;
 constexpr unsigned GROUP_PITCH_B16 = VSTS_ALIGN / 2u;  // in b16 elements
-// vselr byte indices only reach the low 128 bytes of the source, so one gather
-// can span 4 padded groups (64 b16 in, 32 out): 2*(i & 0xF0) + (i & 0x0F) then
-// tops out at 111. Eight groups would need index 239 and silently truncates.
+// RULE: vselr byte indices only reach the low 128 bytes of the source, so one
+// gather spans 4 padded groups. Eight would need index 239 and truncate
+// silently.
 constexpr unsigned GROUPS_PER_COMPACT = 4;
 constexpr unsigned EVENT_SLOTS = 8;  // size of the event-id array
 // hadamard-style guard: the list below writes eight EVENT_IDs by hand, and a
@@ -97,13 +93,11 @@ struct QuantShape {
       (in_bytes + UB_ALIGN - 1) & ~(UB_ALIGN - 1);
   static constexpr unsigned aligned_q =
       (q_bytes + UB_ALIGN - 1) & ~(UB_ALIGN - 1);
-  // scale bytes are padded to one 32-byte slot per 8-block group, so every
-  // store is aligned; the GM side stays packed (see the store loop below)
+  // room for the padded form; pass B writes it packed after A2
   static constexpr unsigned scale_padded = groups * VSTS_ALIGN;
   static constexpr unsigned aligned_s =
       (scale_padded + UB_ALIGN - 1) & ~(UB_ALIGN - 1);
-  // maxima are b16, padded the same way. Pass B reads a whole register per
-  // group and only the low 8 lanes matter, so leave one register of headroom.
+  // padded to a 32-byte pitch, plus a register of read-ahead headroom
   static constexpr unsigned aligned_max =
       (groups * VSTS_ALIGN + B16_LANES * 2u + UB_ALIGN - 1) & ~(UB_ALIGN - 1);
   static constexpr unsigned aligned_packed =
@@ -130,10 +124,9 @@ struct QuantShape {
                 "PREFETCH == NBUF drains every MTE3->MTE2 token: deadlock");
 };
 
-// Byte offsets within one pipeline slot, plus the shared scratch. Constexpr
+// Byte offsets within a pipeline slot, plus shared scratch. Constexpr
 // *variables*, not functions: a constexpr function cannot be called from
-// [aicore] code even to initialise a constexpr, so the slot's base is
-// multiplied in at the use site instead.
+// [aicore] code, so the slot base is multiplied in at the use site.
 template <typename Shape>
 struct SlotOffset {
   static constexpr unsigned x = 0;
@@ -154,15 +147,9 @@ template <typename T, unsigned Elems>
 using UbTile = Tile<TileType::Vec, T, 1, Elems, BLayout::RowMajor, 1, Elems>;
 
 // ------------------------------------------------------------------- pass A
-// Per-32-element magnitude max. DEVICE-MEASURED: vcgmax on b16 reduces groups
-// of
-// **16** lanes and returns 8 results in lanes 0..7 -- a ramp 0..127 comes back
-// as 15,31,47,...,127. The group is 8 for b32, which is what CANN's fp32 MXFP8
-// path uses; that number does not carry over. So a 32-element block wants a 2:1
-// fold: one DINTLV_B16 load puts elements 2i and 2i+1 in lane i of two
-// registers, one vmax folds them, and vcgmax's 16-lane groups then line up
-// exactly with blocks. A 4:1 fold instead merges block pairs and silently
-// reports max(block 2j, block 2j+1) -- which is how this was found.
+// Per-32-element magnitude max. A 2:1 fold makes 16 lanes == one block,
+// which is what vcgmax's group size requires. A 4:1 fold silently reports
+// max(block 2j, block 2j+1) instead.
 template <typename Shape>
 __tf__ static AICORE void abs_block_max(__ubuf__ uint16_t *x,
                                         __ubuf__ uint16_t *maxima) {
@@ -197,12 +184,9 @@ __tf__ static AICORE void abs_block_max(__ubuf__ uint16_t *x,
 // each element over 16 lanes while a block spans 32, so a doubled array turns
 // x16 into the x32 actually needed. CANN does the same for its MXFP8 path.
 // ------------------------------------------------- pass A2 (compaction)
-// vsts needs a 32-byte-aligned address, so pass A leaves each group's 8 maxima
-// in a 32-byte slot: 8 live b16 then 8 holes. Tile also refuses a sub-32-byte
-// DMA, so the holes cannot be skipped downstream either -- they have to be
-// squeezed out here. One vselr does it: output byte i takes input byte 2*(i &
-// 0xF0) + (i & 0x0F), which turns 8 padded groups (128 b16) into 64 contiguous
-// maxima. The index ramp does not depend on the iteration.
+// Squeeze out the padding pass A had to leave (see VSTS_ALIGN). One vselr
+// takes output byte i from input byte 2*(i & 0xF0) + (i & 0x0F); the ramp
+// is loop-invariant. This pass is an alignment tax, not algorithm.
 template <typename Shape>
 __tf__ static AICORE void compact_maxima(__ubuf__ uint16_t *padded,
                                          __ubuf__ uint16_t *packed) {
@@ -253,8 +237,7 @@ __tf__ static AICORE void scale_and_mult(__ubuf__ uint16_t *maxima,
       vsts(byte, scale + (uint32_t)iter * 64u, 0, PK_B16, all);
       vsub(recip, recip_off, b, all);  // 1/X exponent field = 256 - b
       vshls(recip, recip, BF16_MANT_BITS, all, MODE_ZEROING);
-      // each multiplier twice: pass C reads with E2B_B16, which replicates x16
-      // while a block spans 32, so a doubled array gives the x32 needed
+      // twice each: E2B_B16 replicates x16 but a block spans 32
       vintlv(d0, d1, recip, recip);
       vsts(d0, mult + (uint32_t)iter * 2u * B16_LANES, 0, NORM_B16, all);
       vsts(d1, mult + (uint32_t)iter * 2u * B16_LANES + B16_LANES, 0, NORM_B16,
@@ -265,11 +248,8 @@ __tf__ static AICORE void scale_and_mult(__ubuf__ uint16_t *maxima,
 }
 
 // ------------------------------------------------------------------- pass C
-// Scale, cast, pack. One vcvt with a full 128-lane predicate consumes 128 bf16
-// and deposits 64 packed bytes at byte STRIDE 4 (PART_P0 -> offset 0); a vselr
-// with a 4*i byte-index ramp gathers those into 64 contiguous bytes. That is
-// why only PART_P0 is needed: the other phases exist to let four casts share
-// one register, which buys nothing once vselr does the compaction.
+// Scale, cast, pack. One vcvt consumes 128 bf16 and deposits 64 bytes at
+// byte STRIDE 4; a 4*i vselr ramp gathers them. Only PART_P0 is needed.
 template <typename Shape>
 __tf__ static AICORE void quant_pack(__ubuf__ uint16_t *x,
                                      __ubuf__ uint16_t *mult,
