@@ -2,6 +2,7 @@
 
 Quantizes a `(batch, K)` **bfloat16** matrix to OCP MXFP4 on the Ascend 950 / A5
 (`dav-c310`) vector core, JIT-compiled with `bisheng` and loaded through `ctypes`.
+**A5 only** — MXFP4 does not exist on A2/A3 and the fp4 cast is A5-specific.
 
 Each consecutive run of **32 elements** shares one E8M0 scale byte; each element
 becomes one E2M1 nibble. Outputs are `q` `(batch, K/2)` uint8 and `scale`
@@ -93,26 +94,26 @@ tiles prefetched:
 
 | pass | does | width |
 |---|---|---|
-| A | magnitude max per 32-element block | 256 elements → 8 maxima |
-| A2 | compact the padding pass A must leave | 4 groups → 32 maxima |
-| B | maxima → scale byte + bf16 reciprocal | 128 blocks |
-| C | scale, cast to E2M1, pack nibbles | 128 elements → 64 bytes |
+| `abs_block_max` | magnitude max per 32-element block | 256 elements → 8 maxima |
+| `compact_maxima` | squeeze out the padding the store alignment forces | 4 groups → 32 maxima |
+| `scale_and_mult` | maxima → E8M0 byte + bf16 reciprocal | 128 blocks |
+| `quant_pack` | scale, cast to E2M1, pack nibbles | 128 elements → 64 bytes |
 
-Pass A relies on a 2:1 fold so that 16 lanes correspond to one block, which is what
-`vcgmax`'s group size on b16 requires. Pass C does one `vcvt` (128 bf16 → 64 bytes
+`abs_block_max` relies on a 2:1 fold so that 16 lanes correspond to one block, which is what
+`vcgmax`'s group size on b16 requires. `quant_pack` does one `vcvt` (128 bf16 → 64 bytes
 at byte stride 4) and one `vselr` to gather them contiguous.
 
 ### The alignment tax
 
 `vsts` requires a **32-byte-aligned** UB destination, and `vcgmax` on b16 yields
 only 8 results (16 bytes) — so consecutive groups would land 16 bytes apart and
-fault the vector core. Pass A therefore writes each group into a 32-byte slot and
-**pass A2 exists purely to squeeze the holes back out**. `Tile` also refuses a
+fault the vector core. `abs_block_max` therefore writes each group into a 32-byte slot and
+**`compact_maxima` exists purely to squeeze the holes back out**. `Tile` also refuses a
 sub-32-byte DMA, so the padding cannot instead be skipped on the way to GM.
 
 That extra UB round trip is the known inefficiency. The idea worth trying is
 storing the maxima zero-extended to b32, which makes each group exactly 32 bytes
-and contiguous, deleting pass A2 at the cost of moving pass B into the b32 domain.
+and contiguous, deleting `compact_maxima` at the cost of moving `scale_and_mult` into the b32 domain.
 
 ## Correctness
 

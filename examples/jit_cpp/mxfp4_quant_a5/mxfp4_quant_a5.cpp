@@ -7,8 +7,13 @@
 // exponent field 256 - b, both from the same clamped b so they stay exact
 // inverses. The cast saturates at ±6 on its own: no clipping code, no set_ctrl.
 //
-// Four passes: A reduces blocks to maxima, A2 compacts them (see VSTS_ALIGN),
-// B derives scale bytes and reciprocals, C scales/casts/packs.
+// Four passes, named for what they do: abs_block_max reduces each 32-element
+// block to its magnitude max, compact_maxima squeezes out the padding the store
+// alignment forces (see VSTS_ALIGN), scale_and_mult derives the E8M0 byte and
+// the bf16 reciprocal, and quant_pack scales, casts and packs the nibbles.
+//
+// A5 (dav-c310) only, and not portable: MXFP4 does not exist on A2/A3, the fp4
+// cast is A5-only, and the lane semantics below were measured on this part.
 //
 // Every non-obvious constraint below was measured, not assumed. The evidence --
 // probe output, A/B runs, and what the wrong version looked like -- is in
@@ -42,11 +47,11 @@ constexpr unsigned B16_LANES = 128;  // bf16 lanes in one vector register
 // 0..7. The 8 in CANN's TQuant.hpp is the b32 group; it does not carry over.
 constexpr unsigned VCGMAX_B16_GROUP = 16;
 constexpr unsigned VCGMAX_B16_RESULTS = B16_LANES / VCGMAX_B16_GROUP;
-static_assert(VCGMAX_B16_RESULTS == 8, "pass A stores with PAT_VL8");
+static_assert(VCGMAX_B16_RESULTS == 8, "abs_block_max stores with PAT_VL8");
 // RULE: vsts needs a 32-byte-aligned UB address or the vector core faults with
 // 507035. Eight b16 results are 16 bytes, so groups get a 32-byte pitch and
-// pass A2 squeezes the holes out. Tile also refuses a sub-32-byte DMA, so the
-// padding cannot instead be skipped on the GM side.
+// compact_maxima squeezes the holes out. Tile also refuses a sub-32-byte DMA,
+// so the padding cannot instead be skipped on the GM side.
 constexpr unsigned VSTS_ALIGN = 32;
 constexpr unsigned GROUP_PITCH_B16 = VSTS_ALIGN / 2u;  // in b16 elements
 // RULE: vselr byte indices only reach the low 128 bytes of the source, so one
@@ -58,7 +63,7 @@ constexpr unsigned EVENT_SLOTS = 8;  // size of the event-id array
 // larger array would zero-fill and alias every extra buffer onto EVENT_ID0.
 static_assert(EVENT_SLOTS == 8, "extend buffer_free's initialiser first");
 constexpr unsigned UB_ALIGN = 512;
-// 256 KB on A5, 192 on A2/A3, 128 on Kirin. Device pass only.
+// A5 has 256 KB. Device pass only. This kernel is A5-only regardless.
 constexpr unsigned UB_BYTES = PTO_UBUF_SIZE_BYTES;
 
 // bf16 bit-field constants. bf16 is 1-8-7, so a magnitude's biased exponent is
@@ -93,7 +98,7 @@ struct QuantShape {
       (in_bytes + UB_ALIGN - 1) & ~(UB_ALIGN - 1);
   static constexpr unsigned aligned_q =
       (q_bytes + UB_ALIGN - 1) & ~(UB_ALIGN - 1);
-  // room for the padded form; pass B writes it packed after A2
+  // room for the padded form; scale_and_mult writes it packed after compaction
   static constexpr unsigned scale_padded = groups * VSTS_ALIGN;
   static constexpr unsigned aligned_s =
       (scale_padded + UB_ALIGN - 1) & ~(UB_ALIGN - 1);
@@ -146,7 +151,7 @@ using GmStride = pto::Stride<1, 1, 1, Elems, 1>;
 template <typename T, unsigned Elems>
 using UbTile = Tile<TileType::Vec, T, 1, Elems, BLayout::RowMajor, 1, Elems>;
 
-// ------------------------------------------------------------------- pass A
+// ------------------------------------------------------- abs_block_max
 // Per-32-element magnitude max. A 2:1 fold makes 16 lanes == one block,
 // which is what vcgmax's group size requires. A 4:1 fold silently reports
 // max(block 2j, block 2j+1) instead.
@@ -178,14 +183,15 @@ __tf__ static AICORE void abs_block_max(__ubuf__ uint16_t *x,
   }
 }
 
-// ------------------------------------------------------------------- pass B
+// ------------------------------------------------------ scale_and_mult
 // maxima -> E8M0 scale byte + bf16 reciprocal. The multiplier array is stored
-// with every entry DUPLICATED: pass C reads it with E2B_B16, which replicates
-// each element over 16 lanes while a block spans 32, so a doubled array turns
-// x16 into the x32 actually needed. CANN does the same for its MXFP8 path.
-// ------------------------------------------------- pass A2 (compaction)
-// Squeeze out the padding pass A had to leave (see VSTS_ALIGN). One vselr
-// takes output byte i from input byte 2*(i & 0xF0) + (i & 0x0F); the ramp
+// with every entry DUPLICATED: quant_pack reads it with E2B_B16, which
+// replicates each element over 16 lanes while a block spans 32, so a doubled
+// array turns x16 into the x32 actually needed. CANN does the same for its
+// MXFP8 path.
+// ------------------------------------------------------ compact_maxima
+// Squeeze out the padding abs_block_max had to leave (see VSTS_ALIGN). One
+// vselr takes output byte i from input byte 2*(i & 0xF0) + (i & 0x0F); the ramp
 // is loop-invariant. This pass is an alignment tax, not algorithm.
 template <typename Shape>
 __tf__ static AICORE void compact_maxima(__ubuf__ uint16_t *padded,
@@ -247,7 +253,7 @@ __tf__ static AICORE void scale_and_mult(__ubuf__ uint16_t *maxima,
   }
 }
 
-// ------------------------------------------------------------------- pass C
+// ---------------------------------------------------------- quant_pack
 // Scale, cast, pack. One vcvt consumes 128 bf16 and deposits 64 bytes at
 // byte STRIDE 4; a 4*i vselr ramp gathers them. Only PART_P0 is needed.
 template <typename Shape>
