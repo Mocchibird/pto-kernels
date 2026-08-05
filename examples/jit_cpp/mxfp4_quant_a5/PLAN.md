@@ -27,11 +27,16 @@ open question in section 7, not a settled number. -->
 > guarding the *definition* instead turns the kernel into a silent no-op that
 > returns its input unchanged with plausible timings.
 >
-> **Do not build `copy_ref_mxfp4_a5.cpp`.** The hand-written DMA-floor twin this plan
-> specifies is the single approach that cost the most time on the Hadamard kernel: it
-> read 2764–3660 GB/s (33% spread) and was partly cache-fed, so every ratio taken
-> against it flattered the kernel. Use a **torch device-to-device copy** of the same
-> byte count instead — it measured 3023–3025 GB/s, a 0.08% spread, across every shape.
+> **The DMA-floor twin stays, but must be measured properly.** An earlier version of
+> this header said not to build `copy_ref_mxfp4_a5.cpp` at all, generalising from the
+> Hadamard kernel where a hand-written copy reference read 2764–3660 GB/s (33% spread),
+> was partly cache-fed, and flattered every ratio taken against it. That
+> generalisation is wrong here: MXFP4 traffic is **asymmetric** — per 32 elements it
+> reads 64 B of fp16 and writes 17 B (16 nibble + 1 scale) — and a torch
+> device-to-device copy moves equal volumes each way, so it cannot bound a read-heavy
+> pattern. The twin is the only thing that reproduces the real traffic shape. What
+> went wrong on Hadamard was the *measurement*, not the twin; §4.8 pins how to measure
+> it, and keeps a torch copy at matched total volume as an independent sanity bound.
 >
 > **Corrected constants and baselines.**
 > - UB on A5 is **256 KB** (`PTO_UBUF_SIZE_BYTES`), not the 192 KB assumed here;
@@ -587,6 +592,64 @@ Whether the exec and ld/st pipes truly issue in parallel is load-bearing for thi
 Also unknown: how many architectural vector registers A5 exposes. A ~40-live-register 4-way-unrolled probe compiled clean with no spills (`.text` 0x360), but no documented count and no spill diagnostic exists, and there is **no working disassembler** for this device target (`llvm-objdump` prints `<not available>` for every instruction in `__aicore_rel_binary`). So op counts cannot be verified statically — sweep the unroll factor and watch for a throughput cliff.
 
 ---
+
+### 4.8 Testing contract — reconciled with `.skills/testing-pto-kernels`
+
+The repo gained `.skills/testing-pto-kernels/SKILL.md` after this plan was drafted. It
+carries a **Definition Of Done** and mandatory helpers. Where this plan is already
+stricter, it wins and says so; where the skill adds a requirement, it is adopted here.
+
+**Adopted from the skill — these were missing from the plan.**
+
+| requirement | why it matters here |
+|---|---|
+| Real-device correctness runs get **5 repeats** (`pto_demo_utils.device_repeats()`) | The skill's stated purpose is surfacing nondeterministic `set_flag`/`wait_flag` bugs. This kernel is a **three-pass pipeline** — exactly that risk class. The Hadamard tests ran once per case and would not have caught it. |
+| **Two** timeout layers: whole-process via `reference/run_with_timeout.sh` (`PTO_PROCESS_TIMEOUT_S`, 60 s device) **and** per-sync via `pto_demo_utils.synchronize_device()` (`PTO_SYNC_TIMEOUT_S`) | A sync bug deadlocks rather than mismatching. The Hadamard work used `task-submit --max-time 0` — no bound at all — and a run died mid-flight, leaving artifact mtimes as the only way to tell "finished" from "ssh dropped". |
+| Report **RMSE relative to output magnitude, and R²**, not max-error alone | The skill requires this for outlier-heavy kernels, which MXFP4 is by definition — spreading outliers is why a Hadamard rotation precedes 4-bit quantisation. Max-error only reports whichever value landed worst in a 16-level grid. This is the *quality* metric, separate from the bit-exactness gate, and it is what makes our output comparable to `torch_npu`'s. |
+| Derive `block_dim` from `pto_demo_utils.vector_core_count()`, do not hardcode 64 | The skill says prefer runtime queries over hardcoded core counts; A5 SKUs differ. Pin the *policy*, not the integer, and document it in the README. |
+| Use `pto_demo_utils` for `assert_close`, `stream_ptr`, `tensor_ptr`, `synchronize_device`, `device_repeats` | Hand-rolling these is what produced the Hadamard `stream_ptr` import-time regression. |
+| Shape coverage must include **more logical work than physical cores** | Stated explicitly rather than assumed: with `block_dim` = vector-core count, `batch = 65536` satisfies it; say so in the test comment. |
+| State the shape contract in the deliverable | **`batch` dynamic; `K` static (compile-time template argument); group size 32 static.** The skill asks for this sentence verbatim in the report. |
+| Definition Of Done item 4: record exact commands and results | In this directory's `README.md`, and add the device-run commands to `reference/verification-log.md`. |
+
+**Where this plan is stricter — keep it, do not relax to the skill's floor.**
+
+- The skill's numeric thresholds (`fp16 rtol=1e-3, atol=1e-5`) are a *tolerance*. §1.3 C1
+  demands **100% bit-exactness** on scale bytes and nibbles against a host reference
+  modelling the same cast chain. Integers with a tolerance would be a bug, not a gate.
+  Note for contrast: the Hadamard test used `rel_error < 0.03`, **30× looser** than the
+  skill's default, while measuring 6.7e-4…9.4e-4 — the slack bought nothing and would
+  have hidden a regression. Do not repeat that.
+- The skill asks for median over repeats; §4.6 already requires **median of ≥7
+  per-launch event pairs with p05/p95**, a pinned `block_dim` with no best-of-N, and a
+  per-contender pool counter. Keep all of it.
+- The adversarial block set (§4.5) has no counterpart in the skill and is the reason
+  D1 was found. Keep it.
+
+**C2's DMA floor — how to measure the twin so it does not mislead.**
+
+`copy_ref_mxfp4_a5.cpp` is retained (see the header: a torch copy cannot reproduce
+read-heavy asymmetric traffic). It is only trustworthy if measured under the *same*
+harness as the kernel:
+
+1. **Identical pool, timing path and cache-flush behaviour** as the contender it bounds.
+   Mixing per-launch and loop-amortised timing across contenders manufactures a win on
+   its own (§4.6 already says this — it applies to row 5 too).
+2. **Pin the working-set footprint and verify it at both ends of every sweep.** The
+   Hadamard harness derived pool depth from a target footprint but a `POOL_MAX` clamp
+   silently let the working set grow 8 MB → 256 MB across the batch sweep; the small
+   batches were partly cache-fed and the bandwidth curve kinked at the cache knee.
+   Print the derived footprint for the first and last point of each sweep and assert it
+   is constant.
+3. **Cross-check against a torch device-to-device copy at matched *total* byte volume.**
+   It cannot model the asymmetry, but it is a stable independent bound (0.08% spread
+   across shapes on this box), so a twin reading far above it is a measurement bug.
+4. **Roofline sanity, per the skill:** a floor above the HBM bound means the timer
+   missed async work or cache reuse is being counted as bandwidth. Fail the row rather
+   than reporting it.
+
+**Stale reference.** §4.2's file list is "verified against `fef2cae`"; re-verify against
+`3872ecb` (the merged `fast_hadamard_a5`) before using it.
 
 ## 5. Stage 2 — `examples/jit_cpp/fused_hadamard_mxfp4_quant_a5`
 
