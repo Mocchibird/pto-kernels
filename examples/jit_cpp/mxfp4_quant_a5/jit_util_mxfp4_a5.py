@@ -15,7 +15,7 @@ SRC = HERE / "mxfp4_quant_a5.cpp"
 K = 4096  # default row width; must match DEFAULT_K in the kernel
 MX_BLOCK = 32
 BLOCK_DIM = 64  # overridden by vector_core_count() where available
-TILE_ELEMS = 8192  # must match TILE_ELEMS in the kernel
+TILE_ELEMS = 16384  # must match TILE_ELEMS in the kernel
 SUPPORTED_K = (128, 256, 512, 1024, 2048, 4096)
 
 # (block_dim, stream, x, q, s, batch, k)

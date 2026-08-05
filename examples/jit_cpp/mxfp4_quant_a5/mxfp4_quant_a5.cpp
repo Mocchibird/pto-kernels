@@ -17,8 +17,11 @@ constexpr unsigned MX_BLOCK = 32;    // MXFP4 block: 32 elements, one E8M0 scale
 constexpr unsigned DEF_BUFFERS = 4;  // UB buffers in the GM<->UB pipeline
 constexpr unsigned DEF_PREFETCH = 2;  // tiles in flight ahead of the compute
 
-// 16 KB bf16 tile. Must match rows_for() in jit_util_mxfp4_a5.py.
-constexpr unsigned TILE_ELEMS = 8192;
+// 32 KB bf16 tile. Must match rows_for() in jit_util_mxfp4_a5.py. Measured
+// against 8192 and 32768: 8192 leaves DMA on the table (its own no-compute
+// floor is 6-11% below this one's), and 32768 only fits with NBuffers=3 and
+// then reaches 98% of UB.
+constexpr unsigned TILE_ELEMS = 16384;
 constexpr unsigned PASS_B_GRAIN = 4096;  // 128 blocks of 32
 template <unsigned K>
 struct RowsFor {
@@ -65,29 +68,27 @@ struct QuantShape {
   static constexpr unsigned q_bytes = tile_elems / 2u;
   static constexpr unsigned scale_bytes = blocks;
 
-  // One "group" is one vcgmax: 8 blocks == 256 elements. Passes A and B both
-  // step by groups; C consumes 128 elements and emits 64 packed bytes.
+  // One "group" is one vcgmax: 8 blocks == 256 elements, which is also what one
+  // quant_pack iteration consumes, emitting 128 packed bytes.
   static constexpr unsigned groups = blocks / VCGMAX_B16_RESULTS;
   // one vselr squeezes 8 padded groups into 64 contiguous maxima
   static constexpr unsigned compact_iters = groups / GROUPS_PER_COMPACT;
   static constexpr unsigned b_iters = blocks / B16_LANES;
-  static constexpr unsigned c_iters = tile_elems / B16_LANES;
+  static constexpr unsigned c_iters = tile_elems / (2u * B16_LANES);
 
   static constexpr unsigned aligned_in =
       (in_bytes + UB_ALIGN - 1) & ~(UB_ALIGN - 1);
   static constexpr unsigned aligned_q =
       (q_bytes + UB_ALIGN - 1) & ~(UB_ALIGN - 1);
-  // room for the padded form; scale_and_mult writes it packed after compaction
-  static constexpr unsigned scale_padded = groups * VSTS_ALIGN;
   static constexpr unsigned aligned_s =
-      (scale_padded + UB_ALIGN - 1) & ~(UB_ALIGN - 1);
+      (scale_bytes + UB_ALIGN - 1) & ~(UB_ALIGN - 1);
   // padded to a 32-byte pitch, plus a register of read-ahead headroom
   static constexpr unsigned aligned_max =
       (groups * VSTS_ALIGN + B16_LANES * 2u + UB_ALIGN - 1) & ~(UB_ALIGN - 1);
   static constexpr unsigned aligned_packed =
       (blocks * 2u + UB_ALIGN - 1) & ~(UB_ALIGN - 1);
   static constexpr unsigned aligned_mult =
-      (blocks * 4u + UB_ALIGN - 1) & ~(UB_ALIGN - 1);
+      (blocks * 2u + UB_ALIGN - 1) & ~(UB_ALIGN - 1);
 
   static constexpr unsigned slot_stride = aligned_in + aligned_q + aligned_s;
   static constexpr unsigned scratch_base = NBuffers * slot_stride;
@@ -101,6 +102,8 @@ struct QuantShape {
                 "blocks must divide into whole vcgmax groups");
   static_assert(groups % GROUPS_PER_COMPACT == 0,
                 "compaction squeezes GROUPS_PER_COMPACT groups at a time");
+  static_assert(tile_elems % (2u * B16_LANES) == 0,
+                "quant_pack consumes 256 elements per iteration");
   static_assert(sizeof(bfloat16_t) == 2, "RowsFor assumes 2-byte elements");
   static_assert(ub_needed <= UB_BYTES, "UB overflow");
   static_assert(NBuffers <= EVENT_SLOTS, "NBUF exceeds the event-id array");
@@ -162,12 +165,6 @@ __tf__ static AICORE void abs_block_max(__ubuf__ uint16_t *x,
   }
 }
 
-// ------------------------------------------------------ scale_and_mult
-// maxima -> E8M0 scale byte + bf16 reciprocal. The multiplier array is stored
-// with every entry DUPLICATED: quant_pack reads it with E2B_B16, which
-// replicates each element over 16 lanes while a block spans 32, so a doubled
-// array turns x16 into the x32 actually needed. CANN does the same for its
-// MXFP8 path.
 // ------------------------------------------------------ compact_maxima
 // Squeeze out the padding VSTS_ALIGN forces: output byte i takes input byte
 // 2*(i & 0xF0) + (i & 0x0F). The ramp is loop-invariant.
@@ -201,6 +198,10 @@ __tf__ static AICORE void compact_maxima(__ubuf__ uint16_t *padded,
   }
 }
 
+// ------------------------------------------------------ scale_and_mult
+// maxima -> E8M0 scale byte + one bf16 reciprocal per block. quant_pack reads
+// this array with E2B_B16, whose x16 replication matches its pair-granular
+// deinterleave exactly, so no duplication is needed here.
 template <typename Shape>
 __tf__ static AICORE void scale_and_mult(__ubuf__ uint16_t *maxima,
                                          __ubuf__ uint16_t *mult,
@@ -211,7 +212,7 @@ __tf__ static AICORE void scale_and_mult(__ubuf__ uint16_t *maxima,
     vdup(recip_off, (uint16_t)RECIP_OFFSET, all, MODE_ZEROING);
 
     for (uint16_t iter = 0; iter < (uint16_t)Shape::b_iters; ++iter) {
-      vector_u16 amax, b, byte, recip, d0, d1;
+      vector_u16 amax, b, byte, recip;
       vlds(amax, maxima + (uint32_t)iter * B16_LANES, 0, NORM);
       // bit 15 is already clear, so this shift alone yields the biased exponent
       vshrs(b, amax, BF16_MANT_BITS, all, MODE_ZEROING);
@@ -221,19 +222,28 @@ __tf__ static AICORE void scale_and_mult(__ubuf__ uint16_t *maxima,
       vsts(byte, scale + (uint32_t)iter * 64u, 0, PK_B16, all);
       vsub(recip, recip_off, b, all);  // 1/X exponent field = 256 - b
       vshls(recip, recip, BF16_MANT_BITS, all, MODE_ZEROING);
-      // twice each: E2B_B16 replicates x16 but a block spans 32
-      vintlv(d0, d1, recip, recip);
-      vsts(d0, mult + (uint32_t)iter * 2u * B16_LANES, 0, NORM_B16, all);
-      vsts(d1, mult + (uint32_t)iter * 2u * B16_LANES + B16_LANES, 0, NORM_B16,
-           all);
+      vsts(recip, mult + (uint32_t)iter * B16_LANES, 0, NORM_B16, all);
     }
     mem_bar(VST_VLD);
   }
 }
 
 // ---------------------------------------------------------- quant_pack
-// Scale, cast, pack. One vcvt consumes 128 bf16 and deposits 64 bytes at
-// byte STRIDE 4; a 4*i vselr ramp gathers them. Only PART_P0 is needed.
+// Scale, cast, pack -- 256 elements per iteration, no gather.
+//
+// One vcvt turns 128 bf16 into 64 bytes deposited at byte STRIDE 4, offset
+// chosen by PART_P0..P3. Converting two halves into offsets 0 and 1, OR-ing
+// them and storing with PK_B32 (which keeps the low 2 bytes of each 4-byte
+// group) writes 128 CONTIGUOUS bytes, so the compacting vselr disappears.
+// This is CANN's CalcQuantizedFP8Values_Unroll2 shape, with one change: fp4
+// puts two elements in a byte, so an element-granular DINTLV_B16 would pair
+// element 4k with 4k+2. Deinterleaving at b32 -- pairs, not elements -- keeps
+// (4k, 4k+1) together and restores natural order.
+//
+// The halves also share one multiplier register: after a pair-granular
+// deinterleave both b16 lanes 2j and 2j+1 of either half belong to block j/8,
+// so E2B_B16's x16 replication is exactly right and the duplicated multiplier
+// array is no longer needed.
 template <typename Shape>
 __tf__ static AICORE void quant_pack(__ubuf__ uint16_t *x,
                                      __ubuf__ uint16_t *mult,
@@ -241,26 +251,25 @@ __tf__ static AICORE void quant_pack(__ubuf__ uint16_t *x,
   __VEC_SCOPE__ {
     MaskReg all = pset_b16(PAT_ALL);
     MaskReg b8_all = pset_b8(PAT_ALL);
-    uint32_t packed_bytes = 64;
-    MaskReg out64 = CreatePredicate<uint8_t>(packed_bytes);
-
-    // byte-index ramp 0,4,8,...: an int8 ramp scaled by 4 in the b16 domain,
-    // which offsets the pair's high byte by 4 and steps both by 8, i.e. exactly
-    // 4*i with no carry (CANN's castBf16toFp4).
-    vector_f4e2m1x2 ramp;
-    vci((vector_s8 &)ramp, (int8_t)0, INC_ORDER);
-    vmuls((vector_s16 &)ramp, (vector_s16 &)ramp, (int16_t)4, b8_all);
+    MaskReg b32_all = pset_b32(PAT_ALL);
 
     for (uint16_t iter = 0; iter < (uint16_t)Shape::c_iters; ++iter) {
-      vector_u16 in, mu;
-      vector_bf16 scaled;
-      vector_f4e2m1x2 strided, packed;
-      vlds(mu, mult + (uint32_t)iter * 8u, 0, E2B_B16);
-      vlds(in, x + (uint32_t)iter * B16_LANES, 0, NORM);
-      vmul(scaled, (vector_bf16 &)in, (vector_bf16 &)mu, all);
-      vcvt(strided, scaled, all, ROUND_R, PART_P0);
-      vselr((vector_u8 &)packed, (vector_u8 &)strided, (vector_u8 &)ramp);
-      vsts((vector_u8 &)packed, q + (uint32_t)iter * 64u, 0, NORM_B8, out64);
+      vector_u16 mu;
+      vector_u32 even, odd;
+      vector_bf16 lo, hi;
+      vector_f4e2m1x2 p0, p1, packed;
+      vlds(mu, mult + (uint32_t)iter * VCGMAX_B16_RESULTS, 0, E2B_B16);
+      vlds(even, odd, (__ubuf__ uint32_t *)x + (uint32_t)iter * B16_LANES, 0,
+           DINTLV_B32);
+      vmul(lo, (vector_bf16 &)even, (vector_bf16 &)mu, all);
+      vmul(hi, (vector_bf16 &)odd, (vector_bf16 &)mu, all);
+      vcvt(p0, lo, all, ROUND_R, PART_P0);
+      vcvt(p1, hi, all, ROUND_R, PART_P1);
+      vor((vector_u8 &)packed, (vector_u8 &)p0, (vector_u8 &)p1, b8_all);
+      // 256 elements in, but PK_B32 keeps 2 of every 4 bytes: 128 bytes out
+      vsts((vector_u16 &)packed,
+           (__ubuf__ uint16_t *)(q + (uint32_t)iter * B16_LANES), 0, PK_B32,
+           b32_all);
     }
     mem_bar(VST_VLD);
   }
