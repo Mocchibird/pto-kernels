@@ -11,12 +11,11 @@ becomes one E2M1 nibble. Outputs are `q` `(batch, K/2)` uint8 and `scale`
 (one instantiation per supported width, **128 … 4096**, dispatched at run time so
 there is no rebuild per width); the MXFP4 block size 32 is static.
 
-> **Status: correct, not yet optimised.** The gate is bit-exact and 32/30 tests
-> pass on real hardware. There is **no performance claim and no benchmark** in this
-> change — the kernel knowingly carries one extra UB round trip (see
-> "The alignment tax"). Correctness *is* cross-checked against
-> `torch_npu.npu_dynamic_mx_quant` and matches it bit-exactly; only the **speed**
-> comparison is follow-up work.
+> **Status: correct, competitive at some widths, not yet optimised.** The gate is
+> bit-exact against `torch_npu.npu_dynamic_mx_quant` and 30/30 tests pass on real
+> hardware. Bandwidth is **mixed**: ahead at K=512…2048, behind at K=128, 256 and
+> 4096 (see Performance). The kernel knowingly carries one extra UB round trip —
+> see "The alignment tax" — which is the first thing to attack.
 
 ## Files
 
@@ -26,6 +25,9 @@ there is no rebuild per width); the MXFP4 block size 32 is static.
 - `jit_util_mxfp4_a5.py` — build + load. The callable pads the batch to a multiple
   of `ROWS_PER_TILE` and slices back, so any batch size works.
 - `test_mxfp4_quant_a5.py` — 30 tests, bit-exact against `torch_npu`.
+- `benchmark.py` — bandwidth vs `torch_npu`. Plots live in the companion
+  [`pto-kernels-plots`](https://github.com/Mocchibird/pto-kernels-plots/tree/main/mxfp4_quant_a5)
+  repo alongside the raw CSVs.
 
 ## Build & run
 
@@ -149,6 +151,40 @@ says only which value landed worst in a 16-level grid:
 | relative RMSE | R² |
 |---|---|
 | 0.115 | 0.987 |
+
+## Performance
+
+`python benchmark.py --repeat 3 --batch-sweep` — median of 3 full sweeps,
+per-launch `torch.npu.Event` timing, rotating input pool. Bandwidth counts every
+byte the operation moves: `2K` read plus `K/2 + K/32` written, **2.53125 bytes per
+element**, using each contender's own byte count.
+
+![bf16 to MXFP4 bandwidth vs torch_npu on Ascend A5](https://raw.githubusercontent.com/Mocchibird/pto-kernels-plots/main/mxfp4_quant_a5/mxfp4_bandwidth.png)
+
+Both contenders allocate their outputs, which is the only fair comparison:
+`torch_npu` allocates inherently, so measuring it against a preallocated kernel
+would credit us with work we skipped. At batch 65536:
+
+| K | 128 | 256 | 512 | 1024 | 2048 | 4096 |
+|---|---|---|---|---|---|---|
+| ours (GB/s) | 582 | 1093 | **2174** | **2502** | **2646** | 2797 |
+| torch_npu (GB/s) | 605 | 1263 | 1737 | 2401 | 2620 | 2883 |
+| ratio | 0.96 | 0.87 | **1.25** | **1.04** | **1.01** | 0.97 |
+
+A clear win at K=512 (+25%), marginal at K=1024–2048, and **behind at K=128, 256
+and 4096**. Preallocating outputs gains 1–15% depending on shape, most at small K
+where the launch is a larger fraction of the work.
+
+Two things this does **not** claim. Nothing here is at the HBM roofline, so there is
+headroom for both implementations. And the extra UB round trip (the alignment tax)
+has not been removed, so the small-K deficit is measured rather than explained — it
+could be that, launch overhead, or the padded scratch traffic.
+
+The batch sweep is in `mxfp4_bbench.csv`. Read it as per-batch comparisons, not as a
+bandwidth-vs-batch curve: once one input buffer exceeds `WORKING_SET_BYTES` the pool
+floors at `POOL_MIN`, so the footprint is 256 MiB at batch 4k–16k but 1 GiB at 64k
+and 4 GiB at 256k. Both contenders always share the identical pool, so each
+individual comparison is sound.
 
 ## Notes
 
