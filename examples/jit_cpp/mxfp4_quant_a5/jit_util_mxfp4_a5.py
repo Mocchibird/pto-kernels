@@ -16,6 +16,7 @@ K = 4096  # default row width; must match DEFAULT_K in the kernel
 MX_BLOCK = 32
 BLOCK_DIM = 64  # overridden by vector_core_count() where available
 TILE_ELEMS = 16384  # must match TILE_ELEMS in the kernel
+DMA_ALIGN = 32  # a Tile refuses a transfer whose row is under 32 bytes
 SUPPORTED_K = (128, 256, 512, 1024, 2048, 4096)
 
 # (block_dim, stream, x, q, s, batch, k)
@@ -57,8 +58,19 @@ def check_k(k: int) -> int:
 
 
 def rows_for(k: int = K) -> int:
-    """ROWS_PER_TILE for row width ``k``: a 16 KB bf16 tile, floored at 1 row."""
+    """ROWS_PER_TILE for row width ``k``: a 32 KB bf16 tile, floored at 1 row."""
     return max(1, TILE_ELEMS // check_k(k))
+
+
+def row_quantum(k: int = K) -> int:
+    """Rows the batch must be a multiple of before the wrapper has to pad.
+
+    The kernel takes a partial last tile, so this is no longer the tile height.
+    What is left is a DMA floor: a Tile refuses a transfer whose row is not a
+    multiple of 32 bytes, and the scale output is only ``k / MX_BLOCK`` bytes per
+    row, so storing ``n`` rows needs ``n * k / MX_BLOCK`` to be a multiple of 32.
+    """
+    return max(1, DMA_ALIGN * MX_BLOCK // check_k(k))
 
 
 def compile_kernel(force: bool = False, verbose: bool = True) -> Path:
@@ -123,7 +135,7 @@ def load_lib(so_path, block_dim: int = BLOCK_DIM, k: int = K):
     # default case is a silent no-op, so an unchecked k would hand back an
     # untouched output buffer rather than failing.
     check_k(k)
-    rows = rows_for(k)
+    quantum = row_quantum(k)
     kernel = entry(so_path, "call_mxfp4_quant")
 
     def run(x, out=None, stream_ptr=None):
@@ -137,7 +149,7 @@ def load_lib(so_path, block_dim: int = BLOCK_DIM, k: int = K):
         assert x.is_contiguous(), "expected a contiguous tensor; call .contiguous()"
 
         batch = int(x.shape[0])
-        padded = -(-batch // rows) * rows
+        padded = -(-batch // quantum) * quantum
         src = x
         if padded != batch:
             src = torch.zeros((padded, k), device=x.device, dtype=x.dtype)
@@ -173,7 +185,8 @@ def load_lib(so_path, block_dim: int = BLOCK_DIM, k: int = K):
         return q[:batch], s[:batch]
 
     run.block_dim = block_dim
-    run.rows_per_tile = rows
+    run.rows_per_tile = rows_for(k)
+    run.row_quantum = quantum
     return run
 
 

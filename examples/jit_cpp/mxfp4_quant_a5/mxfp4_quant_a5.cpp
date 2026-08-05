@@ -132,6 +132,13 @@ template <typename T, unsigned Elems>
 using GmStride = pto::Stride<1, 1, 1, Elems, 1>;
 template <typename T, unsigned Elems>
 using UbTile = Tile<TileType::Vec, T, 1, Elems, BLayout::RowMajor, 1, Elems>;
+// Same tile with a RUNTIME valid column count, zero-filling the rest in UB, for
+// the one partial tile a batch can end on. Kept as a separate type so the
+// full-tile path keeps compile-time extents and no pad-value setup.
+template <typename T, unsigned Elems>
+using UbTilePart =
+    Tile<TileType::Vec, T, 1, Elems, BLayout::RowMajor, 1, DYNAMIC,
+         SLayout::NoneBox, TileConfig::fractalABSize, PadValue::Zero>;
 
 // ------------------------------------------------------- abs_block_max
 // Per-32-element magnitude max. A 2:1 fold makes 16 lanes == one block,
@@ -291,18 +298,44 @@ inline AICORE void transfer(uint32_t tile_index, uint32_t ub_offset,
   }
 }
 
+// The same, for a tile carrying only `valid` elements. On the way in the rest
+// of the UB tile is zero-filled, so the four passes still run over whole
+// registers and need no partial-register path; on the way out only `valid` is
+// written, so the padding never reaches GM.
+template <typename T, unsigned Elems, bool ToUb>
+inline AICORE void transfer_part(uint32_t tile_index, uint32_t ub_offset,
+                                 __gm__ void *gm_base, uint32_t valid) {
+  UbTilePart<T, Elems> ub;
+  TASSIGN(ub, ub_offset);
+  ub.ColMaskInternal = (int)valid;
+  GlobalTensor<T, GmShape<T, Elems>, GmStride<T, Elems>> gm(
+      (__gm__ T *)gm_base + (uint64_t)tile_index * Elems, GmShape<T, Elems>());
+  if constexpr (ToUb) {
+    TLOAD(ub, gm);
+  } else {
+    TSTORE(gm, ub);
+  }
+}
+
 // Start the async load of this core's nth tile, if it has one. A function, not
 // a lambda: set_flag/wait_flag do not resolve inside a lambda.
 template <typename Shape, unsigned Buffers>
 inline AICORE void issue_load(uint32_t nth, uint32_t core_id,
                               uint32_t core_count, uint32_t tiles,
+                              uint32_t full_tiles, uint32_t tail_elems,
                               const event_t *buffer_free, __gm__ void *x_gm) {
   const uint32_t tile_index = core_id + nth * core_count;
   if (tile_index >= tiles) return;
   const uint32_t buf = nth % Buffers;
+  const uint32_t off = buf * Shape::slot_stride + SlotOffset<Shape>::x;
   wait_flag(PIPE_MTE3, PIPE_MTE2, buffer_free[buf]);
-  transfer<bfloat16_t, Shape::tile_elems, true>(
-      tile_index, buf * Shape::slot_stride + SlotOffset<Shape>::x, x_gm);
+  // at most one tile is partial, and only when batch does not fill it
+  if (tile_index == full_tiles) {
+    transfer_part<bfloat16_t, Shape::tile_elems, true>(tile_index, off, x_gm,
+                                                       tail_elems);
+  } else {
+    transfer<bfloat16_t, Shape::tile_elems, true>(tile_index, off, x_gm);
+  }
   set_flag(PIPE_MTE2, PIPE_V, buffer_free[buf]);
 }
 #endif  // __DAV_VEC__
@@ -322,13 +355,18 @@ __global__ AICORE void mxfp4_quant(__gm__ void *x_gm, __gm__ void *q_gm,
                                             EVENT_ID3, EVENT_ID4, EVENT_ID5,
                                             EVENT_ID6, EVENT_ID7};
   const uint32_t core_id = get_block_idx(), core_count = get_block_num();
-  const uint32_t tiles = batch / Rows;
+  // A batch need not fill a whole number of tiles. The remainder rides along as
+  // one extra, partial tile: zero-filled in UB on the way in so the compute
+  // passes are untouched, and truncated on the way out.
+  const uint32_t full_tiles = batch / Rows;
+  const uint32_t tail_elems = (batch % Rows) * K;
+  const uint32_t tiles = full_tiles + (tail_elems ? 1u : 0u);
 
   for (unsigned i = 0; i < NBuffers; ++i)  // every buffer starts free
     set_flag(PIPE_MTE3, PIPE_MTE2, buffer_free[i]);
   for (unsigned i = 0; i < NPrefetch; ++i)
-    issue_load<Shape, NBuffers>(i, core_id, core_count, tiles, buffer_free,
-                                x_gm);
+    issue_load<Shape, NBuffers>(i, core_id, core_count, tiles, full_tiles,
+                                tail_elems, buffer_free, x_gm);
 
   uint32_t issued = 0;
   for (uint32_t tile_index = core_id; tile_index < tiles;
@@ -336,7 +374,7 @@ __global__ AICORE void mxfp4_quant(__gm__ void *x_gm, __gm__ void *q_gm,
     const uint32_t buf = issued % NBuffers;
     // issued ahead of the wait below, so this load overlaps this tile's compute
     issue_load<Shape, NBuffers>(issued + NPrefetch, core_id, core_count, tiles,
-                                buffer_free, x_gm);
+                                full_tiles, tail_elems, buffer_free, x_gm);
     wait_flag(PIPE_MTE2, PIPE_V, buffer_free[buf]);
     const uint32_t slot = buf * Shape::slot_stride;
     abs_block_max<Shape>((__ubuf__ uint16_t *)(uintptr_t)(slot + Off::x),
@@ -351,9 +389,16 @@ __global__ AICORE void mxfp4_quant(__gm__ void *x_gm, __gm__ void *q_gm,
                       (__ubuf__ uint8_t *)(uintptr_t)(slot + Off::q));
     set_flag(PIPE_V, PIPE_MTE3, buffer_free[buf]);
     wait_flag(PIPE_V, PIPE_MTE3, buffer_free[buf]);
-    transfer<uint8_t, Shape::q_bytes, false>(tile_index, slot + Off::q, q_gm);
-    transfer<uint8_t, Shape::scale_bytes, false>(tile_index, slot + Off::s,
-                                                 s_gm);
+    if (tile_index == full_tiles) {
+      transfer_part<uint8_t, Shape::q_bytes, false>(tile_index, slot + Off::q,
+                                                    q_gm, tail_elems / 2u);
+      transfer_part<uint8_t, Shape::scale_bytes, false>(
+          tile_index, slot + Off::s, s_gm, tail_elems / MX_BLOCK);
+    } else {
+      transfer<uint8_t, Shape::q_bytes, false>(tile_index, slot + Off::q, q_gm);
+      transfer<uint8_t, Shape::scale_bytes, false>(tile_index, slot + Off::s,
+                                                   s_gm);
+    }
     set_flag(PIPE_MTE3, PIPE_MTE2, buffer_free[buf]);
   }
   for (unsigned i = 0; i < NBuffers; ++i)  // drain

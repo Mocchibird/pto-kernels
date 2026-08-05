@@ -22,6 +22,7 @@ from jit_util_mxfp4_a5 import (  # noqa: E402
     compile_kernel,
     kernel_rows_for,
     load_lib,
+    row_quantum,
     rows_for,
 )
 
@@ -110,6 +111,31 @@ def test_matches_vendor(quant_default, batch):
 def test_matches_vendor_at_row_width(k):
     kernel = build_and_load(block_dim=block_dim(), k=k, verbose=False)
     run_and_compare(kernel, make_bf16(4 * rows_for(k), k, k), f"k={k}")
+
+
+@pytest.mark.parametrize("k", SUPPORTED_K)
+def test_partial_last_tile(k):
+    """A batch that does NOT fill its last tile, so the kernel's tail runs.
+
+    Every other shape test uses a whole number of tiles, which would leave the
+    partial-tile path unexercised: it would look correct because it never ran.
+    The batch is a multiple of row_quantum so the wrapper does not pad, making
+    this the kernel's tail rather than the host's zero-fill.
+    """
+    rows, quantum = rows_for(k), row_quantum(k)
+    batch = 3 * rows + quantum
+    assert batch % rows, f"k={k}: batch {batch} fills whole tiles, no tail"
+    assert batch % quantum == 0, f"k={k}: would pad, hiding the kernel tail"
+    kernel = build_and_load(block_dim=block_dim(), k=k, verbose=False)
+    run_and_compare(kernel, make_bf16(batch, k, batch), f"k={k} tail")
+
+
+def test_row_quantum_is_the_dma_floor():
+    """Pinned: the batch multiple the wrapper needs, and that it beats the tile."""
+    expected = {128: 8, 256: 4, 512: 2, 1024: 1, 2048: 1, 4096: 1}
+    assert {k: row_quantum(k) for k in SUPPORTED_K} == expected
+    # the whole point of the tail: the quantum is no longer the tile height
+    assert all(row_quantum(k) < rows_for(k) for k in SUPPORTED_K if rows_for(k) > 1)
 
 
 def test_nibble_order_is_pinned(quant_default):
