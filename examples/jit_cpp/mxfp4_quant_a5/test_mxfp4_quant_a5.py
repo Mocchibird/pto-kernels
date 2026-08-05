@@ -177,16 +177,23 @@ def test_spec_cross_check():
 
 def test_output_is_nontrivial(quant_default):
     """Catches the silent-no-op arch-flag failure: a kernel compiled for the wrong
-    architecture returns success having written nothing."""
-    x, _ = make_bf16(rows_for(K), K, 11)
-    q = torch.full((x.shape[0], K // 2), 0xAB, device=x.device, dtype=torch.uint8)
-    s = torch.full(
-        (x.shape[0], K // MX_BLOCK), 0xAB, device=x.device, dtype=torch.uint8
-    )
-    quant_default(x, out=(q, s))
-    sync()
-    assert not np.all(q.cpu().numpy() == 0xAB), "q untouched: kernel did not run"
-    assert not np.all(s.cpu().numpy() == 0xAB), "scale untouched: kernel did not run"
+    architecture returns success having written nothing.
+
+    Two different inputs must give two different outputs. That needs no
+    caller-supplied buffers, so it does not depend on their GM alignment.
+    """
+    outs = []
+    for seed in (11, 12):
+        x, _ = make_bf16(rows_for(K), K, seed)
+        q, s = quant_default(x)
+        sync()
+        outs.append((q.cpu().numpy().copy(), s.cpu().numpy().copy()))
+    assert not np.array_equal(
+        outs[0][0], outs[1][0]
+    ), "q identical for different inputs: kernel did not run"
+    assert not np.array_equal(
+        outs[0][1], outs[1][1]
+    ), "scale identical for different inputs: kernel did not run"
 
 
 def test_quantization_quality(quant_default):

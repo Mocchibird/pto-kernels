@@ -161,11 +161,25 @@ def load_lib(so_path, block_dim: int = BLOCK_DIM, k: int = K):
         if padded != batch:
             src = torch.zeros((padded, k), device=x.device, dtype=x.dtype)
             src[:batch] = x
+            # The ctypes launch is not ordered against torch's copy, so without
+            # this the kernel can quantize the still-zero buffer and return all
+            # zeros -- which is a plausible-looking result, not an error.
+            torch.npu.synchronize()
         if out is None:
             q = torch.empty((padded, k // 2), device=x.device, dtype=torch.uint8)
             s = torch.empty((padded, k // MX_BLOCK), device=x.device, dtype=torch.uint8)
         else:
             q, s = out
+            # TSTORE needs a 512-byte-aligned destination. A small torch tensor
+            # is not guaranteed to be, and the failure is silent: the DMA simply
+            # does not land, leaving whatever was in the buffer.
+            for name, t in (("q", q), ("scale", s)):
+                assert t.data_ptr() % 512 == 0, (
+                    f"{name} output is not 512-byte aligned "
+                    f"({t.data_ptr() % 512} off); allocate it larger or let this "
+                    "wrapper allocate it"
+                )
+                assert t.is_contiguous(), f"{name} output must be contiguous"
         kernel(
             int(block_dim),
             stream() if stream_ptr is None else stream_ptr,
