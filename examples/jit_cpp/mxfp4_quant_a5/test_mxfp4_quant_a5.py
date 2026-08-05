@@ -239,6 +239,43 @@ def test_non_contiguous_is_rejected(quant_default):
     quant_default(view.contiguous())  # same data, accepted
 
 
+# The CANN op behind torch_npu is the only other MXFP4 implementation on this
+# device. It is a cross-check, not the gate: it runs on the same hardware, so a
+# shared driver bug would pass, and matching it is a weaker claim than
+# implementing Algorithm 1 correctly. Measured 2026-08-05, CANN 9.0.0: vendor,
+# kernel and host reference are bit-identical on the bf16 path -- there is no
+# double rounding there, so a hard assertion is the right gate. Its scale tensor
+# is (batch, K/64, 2) where ours is (batch, K/32), same count, so reshape.
+def test_matches_vendor_op(quant_default):
+    vendor = getattr(torch, "_dummy", None) or getattr(
+        __import__("torch_npu"), "npu_dynamic_mx_quant", None
+    )
+    if vendor is None:
+        pytest.skip("torch_npu.npu_dynamic_mx_quant not available in this CANN")
+    x, bits = make_bf16(4 * rows_for(K), K, 5)
+    try:
+        v_q, v_s = vendor(x, dst_type=296)  # float4_e2m1fn_x2
+    except Exception as exc:  # pragma: no cover - op signature drift
+        pytest.skip(f"vendor op rejected the call: {type(exc).__name__}: {exc}")
+    sync()
+    q, s = quant_default(x)
+    sync()
+    want_q, want_s = ref.quantize(bits)
+    v_q = v_q.cpu().numpy().reshape(want_q.shape)
+    v_s = v_s.cpu().numpy().reshape(want_s.shape)
+    assert np.array_equal(v_s, want_s), (
+        f"vendor scale bytes differ from the reference "
+        f"({int((v_s != want_s).sum())} of {want_s.size}): our format contract "
+        "and the vendor's have diverged"
+    )
+    assert np.array_equal(v_q, want_q), (
+        f"vendor nibbles differ from the reference "
+        f"({int((v_q != want_q).sum())} of {want_q.size} bytes)"
+    )
+    assert np.array_equal(q.cpu().numpy(), v_q), "kernel differs from the vendor op"
+    assert np.array_equal(s.cpu().numpy(), v_s), "kernel scale differs from the vendor"
+
+
 def test_rows_for_matches_kernel():
     """rows_for() is stated in Python (the padding wrapper needs it before any .so
     exists) and again as RowsFor<K> in the kernel. Pin them together."""

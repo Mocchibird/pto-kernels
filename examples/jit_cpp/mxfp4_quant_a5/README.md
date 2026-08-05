@@ -11,7 +11,7 @@ becomes one E2M1 nibble. Outputs are `q` `(batch, K/2)` uint8 and `scale`
 (one instantiation per supported width, **128 … 4096**, dispatched at run time so
 there is no rebuild per width); the MXFP4 block size 32 is static.
 
-> **Status: correct, not yet optimised.** The gate is bit-exact and 31/31 tests
+> **Status: correct, not yet optimised.** The gate is bit-exact and 32/32 tests
 > pass on real hardware. There is **no performance claim and no benchmark** in this
 > change — the kernel knowingly carries one extra UB round trip (see
 > "The alignment tax"). A benchmark and a comparison against
@@ -27,7 +27,7 @@ there is no rebuild per width); the MXFP4 block size 32 is static.
   formula** that shares no arithmetic with it, so a wrong bias constant cannot hide.
 - `jit_util_mxfp4_a5.py` — build + load. The callable pads the batch to a multiple
   of `ROWS_PER_TILE` and slices back, so any batch size works.
-- `test_mxfp4_quant_a5.py` — 31 tests, bit-exact against the reference.
+- `test_mxfp4_quant_a5.py` — 32 tests, bit-exact against the reference.
 
 ## Build & run
 
@@ -36,7 +36,7 @@ Requires a real A5 device with `torch`/`torch_npu` and the CANN toolkit; set
 
 ```bash
 source /usr/local/Ascend/cann-9.0.0/bin/setenv.bash
-pytest test_mxfp4_quant_a5.py          # 31 tests, bit-exact
+pytest test_mxfp4_quant_a5.py          # 32 tests, bit-exact
 ```
 
 ```python
@@ -116,7 +116,7 @@ and contiguous, deleting pass A2 at the cost of moving pass B into the b32 domai
 
 ## Correctness
 
-`pytest` → **31 passed** on real A5 hardware.
+`pytest` → **32 passed** on real A5 hardware.
 
 The gate is **bit-exact**, not a tolerance: scale bytes and E2M1 nibbles are
 integers, so any mismatch is a bug. Coverage:
@@ -132,7 +132,13 @@ integers, so any mismatch is a bug. Coverage:
 - rejection of an unsupported `K`, a wrong dtype, and a non-contiguous input — the
   kernel can report none of these, so the host must;
 - `ROWS_PER_TILE` queried from the built `.so` and pinned against the Python
-  value, so the two cannot drift.
+  value, so the two cannot drift;
+- a cross-check against `torch_npu.npu_dynamic_mx_quant`, the CANN operator that
+  is the only other MXFP4 implementation on this device. Measured 2026-08-05 on
+  CANN 9.0.0: the vendor op, this kernel and the host reference are **bit-identical**
+  on the bf16 path. It is a cross-check rather than the gate -- it runs on the same
+  hardware, so a shared driver bug would pass it, and matching the vendor is a
+  weaker claim than implementing Algorithm 1 correctly.
 
 Per `.skills/testing-pto-kernels`, device runs repeat (`PTO_DEVICE_REPEATS`,
 default 5) because a four-pass pipeline is where a missing `set_flag`/`wait_flag`
