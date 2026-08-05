@@ -14,8 +14,9 @@ there is no rebuild per width); the MXFP4 block size 32 is static.
 > **Status: correct, not yet optimised.** The gate is bit-exact and 32/32 tests
 > pass on real hardware. There is **no performance claim and no benchmark** in this
 > change — the kernel knowingly carries one extra UB round trip (see
-> "The alignment tax"). A benchmark and a comparison against
-> `torch_npu.npu_dynamic_mx_quant` are follow-up work.
+> "The alignment tax"). Correctness *is* cross-checked against
+> `torch_npu.npu_dynamic_mx_quant` and matches it bit-exactly; only the **speed**
+> comparison is follow-up work.
 
 ## Files
 
