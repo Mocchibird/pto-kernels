@@ -1,12 +1,6 @@
-"""Build + load for the A5 MXFP4 block-quantization kernel.
+"""Build + load for the A5 MXFP4 quantization kernel.
 
-The kernel needs no ``-D``: one .so holds an instantiation per supported ``K`` and
-its launcher dispatches on ``k``, so every row width shares one build. The
-callable pads the batch up to a multiple of ``ROWS_PER_TILE`` and slices the
-results back, so any batch size works.
-
-Shape contract: ``batch`` is dynamic; ``K`` is a compile-time template argument
-(one instantiation per supported width); the MXFP4 block size 32 is static.
+batch dynamic; K a compile-time template argument; block size 32 static.
 """
 
 import ctypes
@@ -63,11 +57,7 @@ def check_k(k: int) -> int:
 
 
 def rows_for(k: int = K) -> int:
-    """ROWS_PER_TILE for row width ``k``: a 16 KB bf16 tile, floored at 1 row.
-
-    The padding wrapper needs this before any .so exists, so it is stated here as
-    well as in the kernel's RowsFor<K>. test_rows_for_matches_kernel pins them.
-    """
+    """ROWS_PER_TILE for row width ``k``: a 16 KB bf16 tile, floored at 1 row."""
     return max(1, TILE_ELEMS // check_k(k))
 
 
@@ -101,8 +91,7 @@ def entry(so_path, name, argtypes=None):
 
 @lru_cache(maxsize=1)
 def stream():
-    """Cached stream pointer. Querying it per launch has measurable cost, and
-    resolving it at import time would require a live NPU just to import."""
+    """Cached stream pointer: querying it per launch has measurable cost."""
     import torch  # noqa: F401
 
     resolved = getattr(torch.npu.current_stream(), "_as_parameter_", None)
@@ -112,11 +101,7 @@ def stream():
 
 
 def kernel_rows_for(so_path):
-    """The kernel's own RowsFor<K>, so a test can pin it against rows_for().
-
-    Raises on an unsupported k rather than returning the kernel's 0, which a
-    caller computing padding would divide by.
-    """
+    """The kernel's own RowsFor<K>, so a test can pin it against rows_for()."""
     fn = getattr(ctypes.CDLL(str(so_path)), "mxfp4_rows_for")
     fn.argtypes = [ctypes.c_uint32]
     fn.restype = ctypes.c_uint32
@@ -131,11 +116,7 @@ def kernel_rows_for(so_path):
 
 
 def load_lib(so_path, block_dim: int = BLOCK_DIM, k: int = K):
-    """Return a callable mapping a (batch, k) bf16 tensor to (q, scale).
-
-    ``q`` is (batch, k/2) uint8 with element 2j in the low nibble; ``scale`` is
-    (batch, k/32) uint8, one E8M0 byte per 32-element block.
-    """
+    """Return a callable mapping a (batch, k) bf16 tensor to (q, scale)."""
     import torch  # noqa: F401
 
     # Validated here as well as in compile_kernel: the dispatching launcher's

@@ -1,18 +1,8 @@
 # pylint: disable=wrong-import-position  # imports are guarded by importorskip
-"""Correctness for the A5 MXFP4 quantization kernel, over K and batch.
+"""Correctness for mxfp4_quant_a5, bit-exact against torch_npu.npu_dynamic_mx_quant.
 
-The reference is **`torch_npu.npu_dynamic_mx_quant`**, the CANN operator a caller
-would otherwise use. The gate is bit-exact: scale bytes and E2M1 nibbles are
-integers, so any mismatch is a bug, not a tolerance. That is stricter than the
-numeric thresholds in `.skills/testing-pto-kernels`, deliberately.
-
-Per that skill: real-device runs repeat (`PTO_DEVICE_REPEATS`, default 5) because a
-four-pass pipeline is where a missing `set_flag`/`wait_flag` shows up
-nondeterministically, and each synchronize is bounded (`PTO_SYNC_TIMEOUT_S`)
-because a sync bug deadlocks rather than mismatching.
-
-If the vendor operator is absent the comparisons **skip**, which is not the same as
-passing -- read the skip reason before believing a green run.
+Device runs repeat (PTO_DEVICE_REPEATS, default 5). If the vendor op is absent the
+comparisons skip, which is not the same as passing.
 """
 
 import sys
@@ -72,11 +62,7 @@ def block_dim() -> int:
 
 
 def vendor_quantize(x):
-    """(q, scale) from the CANN operator, with scale reshaped to match ours.
-
-    The vendor returns scale as (batch, K/64, 2) where ours is (batch, K/32) --
-    same count, different layout, so one side has to be reshaped.
-    """
+    """(q, scale) from the CANN operator, with scale reshaped to match ours."""
     fn = getattr(torch_npu, "npu_dynamic_mx_quant", None)
     if fn is None:
         pytest.skip("torch_npu.npu_dynamic_mx_quant missing: no reference to compare")
@@ -93,8 +79,7 @@ def vendor_quantize(x):
 
 
 def make_bf16(batch, k, seed):
-    """Random bf16 on device, rounded once on the host so the kernel and the vendor
-    see exactly the same values."""
+    """Random bf16, rounded once on the host so both sides see the same values."""
     gen = torch.Generator().manual_seed(seed)
     x = torch.randn(batch, k, generator=gen, dtype=torch.float32)
     return x.to(torch.bfloat16).npu()
@@ -136,12 +121,7 @@ def test_matches_vendor_at_row_width(k):
 
 
 def test_nibble_order_is_pinned(quant_default):
-    """One block of known codes, asserted exactly. No auto-fitting.
-
-    e0=1.0, e1=2.0 with amax 6.0 (scale byte 127) must give first byte 0x42, i.e.
-    element 2j occupies the LOW nibble. Asserted against the pinned convention
-    rather than the vendor, so a vendor change cannot silently redefine our layout.
-    """
+    """One block of known codes, asserted exactly. No auto-fitting."""
     x = torch.zeros((rows_for(K), K), dtype=torch.bfloat16)
     x[0, 0], x[0, 1], x[0, 31] = 1.0, 2.0, 6.0
     q, s = quant_default(x.npu())
@@ -178,9 +158,7 @@ def test_adversarial_blocks(quant_default, name):
 
 
 def test_output_is_nontrivial(quant_default):
-    """Catches the silent-no-op arch-flag failure: a kernel built for the wrong
-    architecture returns success having written nothing. Two different inputs must
-    give two different outputs."""
+    """Two different inputs must give two different outputs."""
     outs = []
     for seed in (11, 12):
         q, s = quant_default(make_bf16(rows_for(K), K, seed))
@@ -195,9 +173,7 @@ def test_output_is_nontrivial(quant_default):
 
 
 def test_quantization_quality(quant_default):
-    """Relative RMSE and R-squared -- the skill's requirement for outlier-heavy
-    kernels. Max error alone only reports whichever value landed worst in a
-    16-level grid."""
+    """Relative RMSE and R-squared, not max error alone."""
     x = make_bf16(1024, K, 13)
     q, s = quant_default(x)
     sync()
@@ -249,8 +225,7 @@ def test_non_contiguous_is_rejected(quant_default):
 
 
 def test_rows_for_matches_kernel():
-    """rows_for() is stated in Python (the padding wrapper needs it before any .so
-    exists) and again as RowsFor<K> in the kernel. Pin them together."""
+    """rows_for() is stated in Python (the padding wrapper needs it before any .so"""
     query = kernel_rows_for(compile_kernel(verbose=False))
     mismatched = {
         k: (rows_for(k), query(k)) for k in SUPPORTED_K if rows_for(k) != query(k)

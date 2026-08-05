@@ -1,23 +1,9 @@
-// mxfp4_quant_a5 — MXFP4 block quantization on the Ascend A5 (dav-c310).
+// mxfp4_quant_a5 — MXFP4 block quantization on Ascend A5 (dav-c310). A5 only.
 //
-// (batch, K) bf16 -> q (batch, K/2) uint8 + scale (batch, K/32) uint8. Every 32
-// elements share one E8M0 byte; each element becomes one E2M1 nibble.
-//
-// Scale rule: OCP MX v1.0 §6.3 Algorithm 1 (FLOOR). byte = b - 2 and 1/X has
-// exponent field 256 - b, both from the same clamped b so they stay exact
-// inverses. The cast saturates at ±6 on its own: no clipping code, no set_ctrl.
-//
-// Four passes, named for what they do: abs_block_max reduces each 32-element
-// block to its magnitude max, compact_maxima squeezes out the padding the store
-// alignment forces (see VSTS_ALIGN), scale_and_mult derives the E8M0 byte and
-// the bf16 reciprocal, and quant_pack scales, casts and packs the nibbles.
-//
-// A5 (dav-c310) only, and not portable: MXFP4 does not exist on A2/A3, the fp4
-// cast is A5-only, and the lane semantics below were measured on this part.
-//
-// Every non-obvious constraint below was measured, not assumed. The evidence --
-// probe output, A/B runs, and what the wrong version looked like -- is in
-// MXFP4_A5_FINDINGS.md.
+// (batch, K) bf16 -> q (batch, K/2) uint8 + scale (batch, K/32) uint8. 32
+// elements share one E8M0 byte; each element becomes one E2M1 nibble. OCP MX
+// v1.0 6.3 Algorithm 1 (FLOOR): byte = b - 2, 1/X exponent field = 256 - b,
+// same clamped b.
 #include <pto/pto-inst.hpp>
 #include <utility>
 using namespace pto;
@@ -31,8 +17,7 @@ constexpr unsigned MX_BLOCK = 32;    // MXFP4 block: 32 elements, one E8M0 scale
 constexpr unsigned DEF_BUFFERS = 4;  // UB buffers in the GM<->UB pipeline
 constexpr unsigned DEF_PREFETCH = 2;  // tiles in flight ahead of the compute
 
-// 16 KB bf16 tile, the size fast_hadamard_a5 measured fastest. Must agree with
-// rows_for() in jit_util_mxfp4_a5.py; test_rows_for_matches_kernel pins them.
+// 16 KB bf16 tile. Must match rows_for() in jit_util_mxfp4_a5.py.
 constexpr unsigned TILE_ELEMS = 8192;
 constexpr unsigned PASS_B_GRAIN = 4096;  // 128 blocks of 32
 template <unsigned K>
@@ -43,24 +28,18 @@ struct RowsFor {
 
 #ifdef __CCE_AICORE__
 constexpr unsigned B16_LANES = 128;  // bf16 lanes in one vector register
-// MEASURED: vcgmax on b16 reduces 16-lane groups and returns 8 results in lanes
-// 0..7. The 8 in CANN's TQuant.hpp is the b32 group; it does not carry over.
+// MEASURED: vcgmax on b16 groups 16 lanes, 8 results in lanes 0..7.
 constexpr unsigned VCGMAX_B16_GROUP = 16;
 constexpr unsigned VCGMAX_B16_RESULTS = B16_LANES / VCGMAX_B16_GROUP;
 static_assert(VCGMAX_B16_RESULTS == 8, "abs_block_max stores with PAT_VL8");
-// RULE: vsts needs a 32-byte-aligned UB address or the vector core faults with
-// 507035. Eight b16 results are 16 bytes, so groups get a 32-byte pitch and
-// compact_maxima squeezes the holes out. Tile also refuses a sub-32-byte DMA,
-// so the padding cannot instead be skipped on the GM side.
+// RULE: vsts needs a 32-byte-aligned UB address, else 507035. Tile refuses a
+// sub-32-byte DMA, so the padding is squeezed out in UB, not on the way to GM.
 constexpr unsigned VSTS_ALIGN = 32;
 constexpr unsigned GROUP_PITCH_B16 = VSTS_ALIGN / 2u;  // in b16 elements
-// RULE: vselr byte indices only reach the low 128 bytes of the source, so one
-// gather spans 4 padded groups. Eight would need index 239 and truncate
-// silently.
+// RULE: vselr indices reach only the low 128 source bytes: 4 groups per gather.
 constexpr unsigned GROUPS_PER_COMPACT = 4;
 constexpr unsigned EVENT_SLOTS = 8;  // size of the event-id array
-// hadamard-style guard: the list below writes eight EVENT_IDs by hand, and a
-// larger array would zero-fill and alias every extra buffer onto EVENT_ID0.
+// the list below writes 8 ids by hand; a bigger array aliases onto EVENT_ID0
 static_assert(EVENT_SLOTS == 8, "extend buffer_free's initialiser first");
 constexpr unsigned UB_ALIGN = 512;
 // A5 has 256 KB. Device pass only. This kernel is A5-only regardless.
@@ -190,9 +169,8 @@ __tf__ static AICORE void abs_block_max(__ubuf__ uint16_t *x,
 // array turns x16 into the x32 actually needed. CANN does the same for its
 // MXFP8 path.
 // ------------------------------------------------------ compact_maxima
-// Squeeze out the padding abs_block_max had to leave (see VSTS_ALIGN). One
-// vselr takes output byte i from input byte 2*(i & 0xF0) + (i & 0x0F); the ramp
-// is loop-invariant. This pass is an alignment tax, not algorithm.
+// Squeeze out the padding VSTS_ALIGN forces: output byte i takes input byte
+// 2*(i & 0xF0) + (i & 0x0F). The ramp is loop-invariant.
 template <typename Shape>
 __tf__ static AICORE void compact_maxima(__ubuf__ uint16_t *padded,
                                          __ubuf__ uint16_t *packed) {
@@ -380,8 +358,7 @@ __global__ AICORE void mxfp4_quant(__gm__ void *x_gm, __gm__ void *q_gm,
 }
 
 // ---------------------------------------------------------------- entry points
-// One .so serves every K. These fold over SUPPORTED_K to find the matching
-// instantiation, which keeps the list of widths in one place.
+// One .so serves every K: fold over SUPPORTED_K for the instantiation.
 template <std::size_t... Idx>
 inline void launch_for_k(uint32_t bd, void *stream, uint8_t *x, uint8_t *q,
                          uint8_t *s, uint32_t batch, uint32_t k,
@@ -394,8 +371,7 @@ inline void launch_for_k(uint32_t bd, void *stream, uint8_t *x, uint8_t *q,
    ...);
 }
 
-// An unsupported k does nothing at all -- it cannot report from here, so the
-// host validates before calling (jit_util_mxfp4_a5.check_k).
+// An unsupported k is a silent no-op; the host validates (check_k).
 extern "C" void call_mxfp4_quant(uint32_t bd, void *stream, uint8_t *x,
                                  uint8_t *q, uint8_t *s, uint32_t batch,
                                  uint32_t k) {
