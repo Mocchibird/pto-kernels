@@ -45,20 +45,15 @@ def repeats() -> int:
 
 
 def sync() -> None:
-    if demo:
-        demo.synchronize_device()
-    else:
-        torch.npu.synchronize()
+    (demo.synchronize_device if demo else torch.npu.synchronize)()
 
 
 def block_dim() -> int:
-    """Derive from the device rather than hardcoding 64: A5 SKUs differ."""
-    if demo:
-        try:
-            return demo.vector_core_count("npu:0")
-        except Exception:  # pragma: no cover - fall back on query failure
-            pass
-    return 64
+    """Query the device; A5 SKUs differ in vector core count."""
+    try:
+        return demo.vector_core_count("npu:0") if demo else 64
+    except Exception:  # pragma: no cover - query failure
+        return 64
 
 
 def vendor_quantize(x):
@@ -92,14 +87,11 @@ def run_and_compare(kernel, x, label):
         q, s = kernel(x)
         sync()
         got_q, got_s = q.cpu().numpy(), s.cpu().numpy()
-        assert np.array_equal(got_s, want_s), (
-            f"{label}: scale bytes differ from the vendor op on attempt {attempt} "
-            f"({int((got_s != want_s).sum())} of {want_s.size})"
-        )
-        assert np.array_equal(got_q, want_q), (
-            f"{label}: nibbles differ from the vendor op on attempt {attempt} "
-            f"({int((got_q != want_q).sum())} of {want_q.size} bytes)"
-        )
+        for what, got, want in (("scale", got_s, want_s), ("nibble", got_q, want_q)):
+            assert np.array_equal(got, want), (
+                f"{label}: {what} differs from the vendor on attempt {attempt} "
+                f"({int((got != want).sum())} of {want.size})"
+            )
 
 
 @pytest.fixture(scope="module")
@@ -126,10 +118,8 @@ def test_nibble_order_is_pinned(quant_default):
     x[0, 0], x[0, 1], x[0, 31] = 1.0, 2.0, 6.0
     q, s = quant_default(x.npu())
     sync()
-    assert int(s.cpu().numpy()[0, 0]) == 127, "scale byte for amax=6.0 must be 127"
-    assert (
-        int(q.cpu().numpy()[0, 0]) == 0x42
-    ), "nibble order changed: element 0 must be the low nibble"
+    assert int(s.cpu().numpy()[0, 0]) == 127, "amax=6.0 must give scale byte 127"
+    assert int(q.cpu().numpy()[0, 0]) == 0x42, "element 0 must be the low nibble"
 
 
 ADVERSARIAL = {
@@ -164,12 +154,11 @@ def test_output_is_nontrivial(quant_default):
         q, s = quant_default(make_bf16(rows_for(K), K, seed))
         sync()
         outs.append((q.cpu().numpy().copy(), s.cpu().numpy().copy()))
-    assert not np.array_equal(
-        outs[0][0], outs[1][0]
-    ), "q identical for different inputs: kernel did not run"
-    assert not np.array_equal(
-        outs[0][1], outs[1][1]
-    ), "scale identical for different inputs: kernel did not run"
+    for what, a, b in (
+        ("q", outs[0][0], outs[1][0]),
+        ("scale", outs[0][1], outs[1][1]),
+    ):
+        assert not np.array_equal(a, b), f"{what} same for both inputs: did not run"
 
 
 def test_quantization_quality(quant_default):
@@ -177,20 +166,19 @@ def test_quantization_quality(quant_default):
     x = make_bf16(1024, K, 13)
     q, s = quant_default(x)
     sync()
-    packed = q.cpu().numpy()
-    codes = np.empty((x.shape[0], K), dtype=np.uint8)
+    packed, rows, nblk = q.cpu().numpy(), x.shape[0], K // MX_BLOCK
+    codes = np.empty((rows, K), dtype=np.uint8)
     codes[:, 0::2], codes[:, 1::2] = packed & 0x0F, packed >> 4
     mag = E2M1_GRID[codes & 0x07]
     signed = np.where((codes & 0x08) != 0, -mag, mag)
     scale = np.exp2(s.cpu().numpy().astype(np.float64) - 127.0)
-    nblk = K // MX_BLOCK
-    blocked = signed.reshape((x.shape[0], nblk, MX_BLOCK)) * scale[:, :, None]
-    recon = blocked.reshape((x.shape[0], K))
+    recon = (signed.reshape((rows, nblk, MX_BLOCK)) * scale[:, :, None]).reshape(
+        rows, K
+    )
     original = x.float().cpu().numpy().astype(np.float64)
-    err = recon - original
-    rms = float(np.sqrt(np.mean(original**2))) or 1.0
-    rmse_rel = float(np.sqrt(np.mean(err**2))) / rms
-    r2 = 1.0 - float(np.mean(err**2)) / float(np.var(original))
+    mse = float(np.mean((recon - original) ** 2))
+    rmse_rel = mse**0.5 / (float(np.sqrt(np.mean(original**2))) or 1.0)
+    r2 = 1.0 - mse / float(np.var(original))
     print(f"\n  MXFP4 quality: rmse/rms={rmse_rel:.4f}  R^2={r2:.4f}")
     # MXFP4 keeps 3 magnitude bits over a 32-element block, so ~0.1 on N(0,1).
     # These bounds catch a broken kernel, not a subtle one.
