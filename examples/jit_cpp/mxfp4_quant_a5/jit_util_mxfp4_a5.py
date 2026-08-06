@@ -123,6 +123,7 @@ def current_stream_ptr():
     import torch
     import torch_npu
 
+    # pylint: disable=protected-access  # the public accessor costs 8.9 us
     raw = getattr(torch_npu._C, "_npu_getCurrentRawStream", None)
     if raw is not None:
         return ctypes.c_void_p(raw(torch.npu.current_device()))
