@@ -92,8 +92,10 @@ struct QuantShape {
 
   static constexpr unsigned slot_stride = aligned_in + aligned_q + aligned_s;
   static constexpr unsigned scratch_base = NBuffers * slot_stride;
+  // every scratch region SlotOffset hands out, in the same order, so the two
+  // cannot drift: omitting one here silently shrinks the UB-overflow guard
   static constexpr unsigned ub_needed =
-      scratch_base + aligned_max + aligned_mult;
+      scratch_base + aligned_max + aligned_packed + aligned_mult;
 
   static_assert(K % MX_BLOCK == 0, "a block may not straddle a row boundary");
   static_assert(tile_elems % PASS_B_GRAIN == 0,

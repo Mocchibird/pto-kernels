@@ -5,6 +5,7 @@ Device runs repeat (PTO_DEVICE_REPEATS, default 5). If the vendor op is absent t
 comparisons skip, which is not the same as passing.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -42,7 +43,9 @@ E2M1_GRID = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float64)
 
 
 def repeats() -> int:
-    return demo.device_repeats() if demo else 5
+    """Floored at 1: a repeat count of 0 would make every comparison loop below
+    iterate zero times, so 25 tests would pass having asserted nothing."""
+    return max(1, int(demo.device_repeats() if demo else 5))
 
 
 def sync() -> None:
@@ -57,15 +60,29 @@ def block_dim() -> int:
         return 64
 
 
+def no_vendor(why: str):
+    """Losing the reference must FAIL, not skip.
+
+    The vendor op is the entire correctness gate: without it 25 of these tests
+    assert nothing. Skipping left a green suite that proved nothing, which is the
+    failure mode GitHub's AI-code-review checklist names explicitly. Set
+    PTO_ALLOW_NO_VENDOR=1 to downgrade to a skip on a machine that genuinely
+    lacks the operator -- deliberately, and visibly in the run command.
+    """
+    if os.environ.get("PTO_ALLOW_NO_VENDOR") == "1":
+        pytest.skip(f"{why} (PTO_ALLOW_NO_VENDOR=1)")
+    pytest.fail(f"{why}: no reference to compare against, so this proves nothing")
+
+
 def vendor_quantize(x):
     """(q, scale) from the CANN operator, with scale reshaped to match ours."""
     fn = getattr(torch_npu, "npu_dynamic_mx_quant", None)
     if fn is None:
-        pytest.skip("torch_npu.npu_dynamic_mx_quant missing: no reference to compare")
+        no_vendor("torch_npu.npu_dynamic_mx_quant is missing")
     try:
         q, s = fn(x, dst_type=VENDOR_DST_TYPE)
     except Exception as exc:  # pragma: no cover - op signature drift
-        pytest.skip(f"vendor op rejected the call: {type(exc).__name__}: {exc}")
+        no_vendor(f"vendor op rejected the call: {type(exc).__name__}: {exc}")
     sync()
     batch, k = x.shape
     return (
@@ -100,11 +117,30 @@ def quant_default():
     return build_and_load(block_dim=block_dim(), verbose=False)
 
 
-# 1000 and 4097 are non-multiples that exercise the padding wrapper; 65536 is more
-# logical work than physical cores (skill: shape coverage).
+# 1000 and 4097 do not fill a whole number of tiles, so they exercise the kernel's
+# partial-tile tail; 65536 is more logical work than physical cores (skill: shape
+# coverage). None of these reaches the host padding path -- row_quantum is 1 at
+# this K, so nothing is ever padded. See test_host_padding_path for that.
 @pytest.mark.parametrize("batch", [64, 128, 1000, 4097, 65536])
 def test_matches_vendor(quant_default, batch):
     run_and_compare(quant_default, make_bf16(batch, K, batch), f"batch={batch}")
+
+
+@pytest.mark.parametrize("k", [128, 256, 512])
+def test_host_padding_path(k):
+    """A batch the wrapper must round up, which nothing else here reaches.
+
+    The kernel's tail takes whole rows, but the scale store has a 32-byte DMA
+    floor, so widths below 1024 still need the host to pad the batch. That path
+    allocates a zero tensor, copies into it and synchronizes -- and it is the one
+    place ordering against torch's copy matters, so it needs its own coverage.
+    """
+    quantum = row_quantum(k)
+    assert quantum > 1, f"k={k} never pads; this test needs a narrower width"
+    batch = 2 * rows_for(k) + quantum - 1
+    assert batch % quantum, "a multiple would skip the padding path entirely"
+    kernel = build_and_load(block_dim=block_dim(), k=k, verbose=False)
+    run_and_compare(kernel, make_bf16(batch, k, batch), f"k={k} padded")
 
 
 @pytest.mark.parametrize("k", SUPPORTED_K)
