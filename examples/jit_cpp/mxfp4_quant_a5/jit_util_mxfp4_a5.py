@@ -6,20 +6,28 @@ batch dynamic; K a compile-time template argument; block size 32 static.
 import ctypes
 import os
 import subprocess
-from functools import lru_cache
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 SRC = HERE / "mxfp4_quant_a5.cpp"
 
-K = 4096  # default row width; must match DEFAULT_K in the kernel
+K = 4096  # default row width when a caller does not choose
 MX_BLOCK = 32
-BLOCK_DIM = 64  # overridden by vector_core_count() where available
+VECTOR_CORES = 64  # overridden by a device query where available
 TILE_ELEMS = 16384  # must match TILE_ELEMS in the kernel
 DMA_ALIGN = 32  # a Tile refuses a transfer whose row is under 32 bytes
-SUPPORTED_K = (128, 256, 512, 1024, 2048, 4096)
+TILE_GRAIN = DMA_ALIGN * MX_BLOCK  # must match TILE_GRAIN in the kernel
+# Widths with an instantiation; mirrors SUPPORTED_K in the kernel. Split string
+# for the same reason as FIXED_FLAGS below: black leaves it alone.
+SUPPORTED_K = tuple(
+    int(k)
+    for k in (
+        "64 96 128 192 256 512 768 896 1024 1152 1280 1408 1536 1664 1792 2048 "
+        "2560 2816 3072 3584 4096 5120 6144 7168 8192 14336"
+    ).split()
+)
 
-# (block_dim, stream, x, q, s, batch, k)
+# (vector_cores, stream, input, nibbles, scales, batch, k)
 KERNEL_ARGS = [
     ctypes.c_uint32,
     ctypes.c_void_p,
@@ -29,10 +37,9 @@ KERNEL_ARGS = [
     ctypes.c_uint32,
     ctypes.c_uint32,
 ]
-DEFAULT_ARGS = KERNEL_ARGS[:-1]  # call_mxfp4_quant_default takes no k
 
 # Flags that never vary. Written as one string and split: black re-explodes a list
-# of short strings to one entry per line, but leaves this alone.
+# of short strings to one bind_launcher per line, but leaves this alone.
 FIXED_FLAGS = (
     "-O2 -std=c++17 -fPIC -Wno-ignored-attributes -Wno-macro-redefined "
     "-mllvm -cce-aicore-stack-size=0x8000 "
@@ -50,7 +57,7 @@ def ascend_home() -> str:
     raise RuntimeError("set ASCEND_HOME_PATH or ASCEND_TOOLKIT_HOME")
 
 
-def check_k(k: int) -> int:
+def check_row_width(k: int) -> int:
     """Validate before any arithmetic that could fail on a bad k."""
     if k not in SUPPORTED_K:
         raise ValueError(f"k must be one of {SUPPORTED_K}, got {k}")
@@ -58,19 +65,22 @@ def check_k(k: int) -> int:
 
 
 def rows_for(k: int = K) -> int:
-    """ROWS_PER_TILE for row width ``k``: a 32 KB bf16 tile, floored at 1 row."""
-    return max(1, TILE_ELEMS // check_k(k))
+    """ROWS_PER_TILE. Must match RowsFor<K>; not simply ``TILE_ELEMS // k``."""
+    check_row_width(k)
+    cap = max(1, TILE_ELEMS // k)
+    for rows in range(cap, 0, -1):
+        if (rows * k) % TILE_GRAIN == 0:
+            return rows
+    raise ValueError(f"no admissible ROWS_PER_TILE for k={k}")
 
 
 def row_quantum(k: int = K) -> int:
-    """Rows the batch must be a multiple of before the wrapper has to pad.
+    """Rows the batch must be a multiple of before the wrapper pads.
 
-    The kernel takes a partial last tile, so this is no longer the tile height.
-    What is left is a DMA floor: a Tile refuses a transfer whose row is not a
-    multiple of 32 bytes, and the scale output is only ``k / MX_BLOCK`` bytes per
-    row, so storing ``n`` rows needs ``n * k / MX_BLOCK`` to be a multiple of 32.
+    The kernel takes a partial last tile, so this is a conservative DMA bound and
+    no longer the tile height.
     """
-    return max(1, DMA_ALIGN * MX_BLOCK // check_k(k))
+    return max(1, DMA_ALIGN * MX_BLOCK // check_row_width(k))
 
 
 def compile_kernel(force: bool = False, verbose: bool = True) -> Path:
@@ -93,7 +103,7 @@ def compile_kernel(force: bool = False, verbose: bool = True) -> Path:
     return so
 
 
-def entry(so_path, name, argtypes=None):
+def bind_launcher(so_path, name, argtypes=None):
     """ctypes-load ``so_path`` and bind the launcher ``name``."""
     fn = getattr(ctypes.CDLL(str(so_path)), name)
     fn.argtypes = list(KERNEL_ARGS if argtypes is None else argtypes)
@@ -101,15 +111,25 @@ def entry(so_path, name, argtypes=None):
     return fn
 
 
-@lru_cache(maxsize=1)
-def stream():
-    """Cached stream pointer: querying it per launch has measurable cost."""
-    import torch  # noqa: F401
+def current_stream_ptr():
+    """Raw pointer for the ACTIVE stream, resolved per launch.
 
-    resolved = getattr(torch.npu.current_stream(), "_as_parameter_", None)
-    if resolved is None:
-        raise RuntimeError("could not resolve the current NPU stream pointer")
-    return resolved
+    MEASURED: caching it globally sent every launch after the first to whichever
+    stream was current first -- a race, not an error. But current_stream() costs
+    8.9 us against a ~12 us launch floor and halved throughput below batch 4096.
+    The raw accessor is 0.25 us, gives the identical pointer, and does follow a
+    `with torch.npu.stream(...)` block.
+    """
+    import torch
+    import torch_npu
+
+    raw = getattr(torch_npu._C, "_npu_getCurrentRawStream", None)
+    if raw is not None:
+        return ctypes.c_void_p(raw(torch.npu.current_device()))
+    handle = getattr(torch.npu.current_stream(), "npu_stream", None)
+    if handle is None:
+        raise RuntimeError("could not resolve the NPU stream pointer")
+    return ctypes.c_void_p(int(handle))
 
 
 def kernel_rows_for(so_path):
@@ -127,69 +147,72 @@ def kernel_rows_for(so_path):
     return query
 
 
-def load_lib(so_path, block_dim: int = BLOCK_DIM, k: int = K):
-    """Return a callable mapping a (batch, k) bf16 tensor to (q, scale)."""
+def load_quantizer(so_path, vector_cores: int = VECTOR_CORES, k: int = K):
+    """Return a callable mapping a (batch, k) bf16 tensor to (nibbles, scales)."""
     import torch  # noqa: F401
 
     # Validated here as well as in compile_kernel: the dispatching launcher's
     # default case is a silent no-op, so an unchecked k would hand back an
     # untouched output buffer rather than failing.
-    check_k(k)
+    check_row_width(k)
     quantum = row_quantum(k)
-    kernel = entry(so_path, "call_mxfp4_quant")
+    kernel = bind_launcher(so_path, "call_mxfp4_quant")
 
-    def run(x, out=None, stream_ptr=None):
+    def run(tensor, out=None, stream_ptr=None):
         assert (
-            x.dim() == 2 and x.shape[1] == k
-        ), f"expected (batch, {k}) bfloat16, got {tuple(x.shape)}"
+            tensor.dim() == 2 and tensor.shape[1] == k
+        ), f"expected (batch, {k}) bfloat16, got {tuple(tensor.shape)}"
         # The kernel reads the buffer as bf16 and as one flat run, and can report
         # neither: a wider dtype is reinterpreted and a strided view is read as if
         # contiguous, both silently.
-        assert x.dtype == torch.bfloat16, f"expected bfloat16, got {x.dtype}"
-        assert x.is_contiguous(), "expected a contiguous tensor; call .contiguous()"
+        assert tensor.dtype == torch.bfloat16, f"expected bfloat16, got {tensor.dtype}"
+        assert (
+            tensor.is_contiguous()
+        ), "expected a contiguous tensor; call .contiguous()"
 
-        batch = int(x.shape[0])
+        batch = int(tensor.shape[0])
         padded = -(-batch // quantum) * quantum
-        src = x
+        padded_input = tensor
         if padded != batch:
-            src = torch.zeros((padded, k), device=x.device, dtype=x.dtype)
-            src[:batch] = x
+            padded_input = torch.zeros(
+                (padded, k), device=tensor.device, dtype=tensor.dtype
+            )
+            padded_input[:batch] = tensor
             # The ctypes launch is not ordered against torch's copy, so without
             # this the kernel can quantize the still-zero buffer and return all
             # zeros -- which is a plausible-looking result, not an error.
             torch.npu.synchronize()
         if out is None:
-            q = torch.empty((padded, k // 2), device=x.device, dtype=torch.uint8)
-            s = torch.empty((padded, k // MX_BLOCK), device=x.device, dtype=torch.uint8)
+            nibbles, scales = (
+                torch.empty((padded, cols), device=tensor.device, dtype=torch.uint8)
+                for cols in (k // 2, k // MX_BLOCK)
+            )
         else:
-            q, s = out
-            # TSTORE needs a 512-byte-aligned destination. A small torch tensor
-            # is not guaranteed to be, and the failure is silent: the DMA simply
-            # does not land, leaving whatever was in the buffer.
-            for name, t in (("q", q), ("scale", s)):
-                assert t.data_ptr() % 512 == 0, (
-                    f"{name} output is not 512-byte aligned "
-                    f"({t.data_ptr() % 512} off); allocate it larger or let this "
-                    "wrapper allocate it"
-                )
-                assert t.is_contiguous(), f"{name} output must be contiguous"
+            nibbles, scales = out
+            # RULE: TSTORE needs a 512-byte-aligned destination and fails
+            # SILENTLY otherwise -- the DMA just does not land.
+            for name, buf in (("nibbles", nibbles), ("scales", scales)):
+                assert buf.data_ptr() % 512 == 0, f"{name} not 512-byte aligned"
+                assert buf.is_contiguous(), f"{name} output must be contiguous"
         kernel(
-            int(block_dim),
-            stream() if stream_ptr is None else stream_ptr,
-            ctypes.c_void_p(src.data_ptr()),
-            ctypes.c_void_p(q.data_ptr()),
-            ctypes.c_void_p(s.data_ptr()),
+            int(vector_cores),
+            current_stream_ptr() if stream_ptr is None else stream_ptr,
+            ctypes.c_void_p(padded_input.data_ptr()),
+            ctypes.c_void_p(nibbles.data_ptr()),
+            ctypes.c_void_p(scales.data_ptr()),
             padded,
             k,
         )
-        return q[:batch], s[:batch]
+        return nibbles[:batch], scales[:batch]
 
-    run.block_dim = block_dim
+    run.vector_cores = vector_cores
     run.rows_per_tile = rows_for(k)
     run.row_quantum = quantum
     return run
 
 
-def build_and_load(block_dim: int = BLOCK_DIM, k: int = K, verbose: bool = True):
-    check_k(k)  # before rows_for divides by it
-    return load_lib(compile_kernel(verbose=verbose), block_dim=block_dim, k=k)
+def build_and_load(vector_cores: int = VECTOR_CORES, k: int = K, verbose: bool = True):
+    check_row_width(k)  # before rows_for divides by it
+    return load_quantizer(
+        compile_kernel(verbose=verbose), vector_cores=vector_cores, k=k
+    )

@@ -1,8 +1,8 @@
 # pylint: disable=wrong-import-position  # imports are guarded by importorskip
 """Correctness for mxfp4_quant_a5, bit-exact against torch_npu.npu_dynamic_mx_quant.
 
-Device runs repeat (PTO_DEVICE_REPEATS, default 5). If the vendor op is absent the
-comparisons skip, which is not the same as passing.
+Runs repeat (PTO_DEVICE_REPEATS, default 5, floored at 1). A missing vendor op
+FAILS rather than skipping: a skip is a green suite proving nothing.
 """
 
 import os
@@ -17,12 +17,14 @@ torch_npu = pytest.importorskip("torch_npu")
 
 from jit_util_mxfp4_a5 import (  # noqa: E402
     K,
+    TILE_GRAIN,
+    TILE_ELEMS,
     MX_BLOCK,
     SUPPORTED_K,
     build_and_load,
     compile_kernel,
     kernel_rows_for,
-    load_lib,
+    load_quantizer,
     row_quantum,
     rows_for,
 )
@@ -48,11 +50,11 @@ def repeats() -> int:
     return max(1, int(demo.device_repeats() if demo else 5))
 
 
-def sync() -> None:
+def synchronize() -> None:
     (demo.synchronize_device if demo else torch.npu.synchronize)()
 
 
-def block_dim() -> int:
+def vector_cores() -> int:
     """Query the device; A5 SKUs differ in vector core count."""
     try:
         return demo.vector_core_count("npu:0") if demo else 64
@@ -60,52 +62,59 @@ def block_dim() -> int:
         return 64
 
 
-def no_vendor(why: str):
-    """Losing the reference must FAIL, not skip.
+def fail_without_vendor(why: str):
+    """Losing the reference must FAIL, not skip: it is the whole correctness gate.
 
-    The vendor op is the entire correctness gate: without it 25 of these tests
-    assert nothing. Skipping left a green suite that proved nothing, which is the
-    failure mode GitHub's AI-code-review checklist names explicitly. Set
-    PTO_ALLOW_NO_VENDOR=1 to downgrade to a skip on a machine that genuinely
-    lacks the operator -- deliberately, and visibly in the run command.
+    PTO_ALLOW_NO_VENDOR=1 downgrades to a skip, for a machine that really lacks
+    the operator -- deliberately, and visibly in the run command.
     """
     if os.environ.get("PTO_ALLOW_NO_VENDOR") == "1":
         pytest.skip(f"{why} (PTO_ALLOW_NO_VENDOR=1)")
     pytest.fail(f"{why}: no reference to compare against, so this proves nothing")
 
 
-def vendor_quantize(x):
-    """(q, scale) from the CANN operator, with scale reshaped to match ours."""
+def vendor_quantize(tensor):
+    """(nibbles, scales) from the CANN operator, reshaped to match ours."""
     fn = getattr(torch_npu, "npu_dynamic_mx_quant", None)
     if fn is None:
-        no_vendor("torch_npu.npu_dynamic_mx_quant is missing")
+        fail_without_vendor("torch_npu.npu_dynamic_mx_quant is missing")
     try:
-        q, s = fn(x, dst_type=VENDOR_DST_TYPE)
+        nibbles, scales = fn(tensor, dst_type=VENDOR_DST_TYPE)
     except Exception as exc:  # pragma: no cover - op signature drift
-        no_vendor(f"vendor op rejected the call: {type(exc).__name__}: {exc}")
-    sync()
-    batch, k = x.shape
-    return (
-        q.cpu().numpy().reshape(batch, k // 2),
-        s.cpu().numpy().reshape(batch, k // MX_BLOCK),
+        fail_without_vendor(f"vendor op rejected the call: {type(exc).__name__}: {exc}")
+    synchronize()
+    batch, k = tensor.shape
+    blocks = k // MX_BLOCK
+    # The vendor lays its scales out as (batch, k/64, 2), so a k that is an ODD
+    # multiple of 32 -- 96 is the shipped one -- has no whole number of pairs and
+    # it emits a padded ceil(blocks/2)*2 columns. Ours is the tight spec layout,
+    # so compare against the leading `blocks` and check the padding is only that.
+    wide = scales.cpu().numpy().reshape(batch, -1)
+    assert wide.shape[1] in (blocks, -(-blocks // 2) * 2), (
+        f"unexpected vendor scale width {wide.shape[1]} for k={k} "
+        f"(blocks={blocks}); the layout assumption no longer holds"
     )
+    return nibbles.cpu().numpy().reshape(batch, k // 2), wide[:, :blocks]
 
 
 def make_bf16(batch, k, seed):
     """Random bf16, rounded once on the host so both sides see the same values."""
     gen = torch.Generator().manual_seed(seed)
-    x = torch.randn(batch, k, generator=gen, dtype=torch.float32)
-    return x.to(torch.bfloat16).npu()
+    values = torch.randn(batch, k, generator=gen, dtype=torch.float32)
+    return values.to(torch.bfloat16).npu()
 
 
-def run_and_compare(kernel, x, label):
-    want_q, want_s = vendor_quantize(x)
-    # repeat: a sync bug is nondeterministic, so one clean pass proves little
+def run_and_compare(kernel, tensor, label):
+    want_nibbles, want_scales = vendor_quantize(tensor)
+    # repeat: a synchronize bug is nondeterministic, so one clean pass proves little
     for attempt in range(repeats()):
-        q, s = kernel(x)
-        sync()
-        got_q, got_s = q.cpu().numpy(), s.cpu().numpy()
-        for what, got, want in (("scale", got_s, want_s), ("nibble", got_q, want_q)):
+        nibbles, scales = kernel(tensor)
+        synchronize()
+        got_nibbles, got_scales = nibbles.cpu().numpy(), scales.cpu().numpy()
+        for what, got, want in (
+            ("scale", got_scales, want_scales),
+            ("nibble", got_nibbles, want_nibbles),
+        ):
             assert np.array_equal(got, want), (
                 f"{label}: {what} differs from the vendor on attempt {attempt} "
                 f"({int((got != want).sum())} of {want.size})"
@@ -113,75 +122,100 @@ def run_and_compare(kernel, x, label):
 
 
 @pytest.fixture(scope="module")
-def quant_default():
-    return build_and_load(block_dim=block_dim(), verbose=False)
+def default_quantizer():
+    return build_and_load(vector_cores=vector_cores(), verbose=False)
 
 
 # 1000 and 4097 do not fill a whole number of tiles, so they exercise the kernel's
 # partial-tile tail; 65536 is more logical work than physical cores (skill: shape
 # coverage). None of these reaches the host padding path -- row_quantum is 1 at
 # this K, so nothing is ever padded. See test_host_padding_path for that.
-@pytest.mark.parametrize("batch", [64, 128, 1000, 4097, 65536])
-def test_matches_vendor(quant_default, batch):
-    run_and_compare(quant_default, make_bf16(batch, K, batch), f"batch={batch}")
+@pytest.mark.parametrize("batch", [1, 7, 33, 64, 128, 1000, 4097, 12345, 65536])
+def test_matches_vendor(default_quantizer, batch):
+    run_and_compare(default_quantizer, make_bf16(batch, K, batch), f"batch={batch}")
 
 
-@pytest.mark.parametrize("k", [128, 256, 512])
+@pytest.mark.parametrize("k", [k for k in SUPPORTED_K if row_quantum(k) > 1])
 def test_host_padding_path(k):
-    """A batch the wrapper must round up, which nothing else here reaches.
-
-    The kernel's tail takes whole rows, but the scale store has a 32-byte DMA
-    floor, so widths below 1024 still need the host to pad the batch. That path
-    allocates a zero tensor, copies into it and synchronizes -- and it is the one
-    place ordering against torch's copy matters, so it needs its own coverage.
-    """
+    """A batch the wrapper must round up: the alloc/copy/synchronize path, which
+    nothing else here reaches and where ordering against torch's copy matters."""
     quantum = row_quantum(k)
     assert quantum > 1, f"k={k} never pads; this test needs a narrower width"
     batch = 2 * rows_for(k) + quantum - 1
     assert batch % quantum, "a multiple would skip the padding path entirely"
-    kernel = build_and_load(block_dim=block_dim(), k=k, verbose=False)
+    kernel = build_and_load(vector_cores=vector_cores(), k=k, verbose=False)
     run_and_compare(kernel, make_bf16(batch, k, batch), f"k={k} padded")
 
 
 @pytest.mark.parametrize("k", SUPPORTED_K)
 def test_matches_vendor_at_row_width(k):
-    kernel = build_and_load(block_dim=block_dim(), k=k, verbose=False)
+    kernel = build_and_load(vector_cores=vector_cores(), k=k, verbose=False)
     run_and_compare(kernel, make_bf16(4 * rows_for(k), k, k), f"k={k}")
 
 
-@pytest.mark.parametrize("k", SUPPORTED_K)
+@pytest.mark.parametrize("k", [k for k in SUPPORTED_K if rows_for(k) > 1])
 def test_partial_last_tile(k):
     """A batch that does NOT fill its last tile, so the kernel's tail runs.
 
-    Every other shape test uses a whole number of tiles, which would leave the
-    partial-tile path unexercised: it would look correct because it never ran.
-    The batch is a multiple of row_quantum so the wrapper does not pad, making
-    this the kernel's tail rather than the host's zero-fill.
+    Every other shape test uses whole tiles, so the tail would look correct by
+    never running. A multiple of row_quantum, so this is the kernel's tail and
+    not the host's zero-fill.
     """
     rows, quantum = rows_for(k), row_quantum(k)
-    batch = 3 * rows + quantum
+    # smallest multiple of quantum past three whole tiles; quantum does not
+    # divide rows at every width (k=96 has rows=128, quantum=10), so nudge on
+    batch = ((3 * rows) // quantum + 1) * quantum
+    if batch % rows == 0:
+        batch += quantum
     assert batch % rows, f"k={k}: batch {batch} fills whole tiles, no tail"
     assert batch % quantum == 0, f"k={k}: would pad, hiding the kernel tail"
-    kernel = build_and_load(block_dim=block_dim(), k=k, verbose=False)
+    kernel = build_and_load(vector_cores=vector_cores(), k=k, verbose=False)
     run_and_compare(kernel, make_bf16(batch, k, batch), f"k={k} tail")
 
 
-def test_row_quantum_is_the_dma_floor():
-    """Pinned: the batch multiple the wrapper needs, and that it beats the tile."""
-    expected = {128: 8, 256: 4, 512: 2, 1024: 1, 2048: 1, 4096: 1}
-    assert {k: row_quantum(k) for k in SUPPORTED_K} == expected
-    # the whole point of the tail: the quantum is no longer the tile height
-    assert all(row_quantum(k) < rows_for(k) for k in SUPPORTED_K if rows_for(k) > 1)
+def test_stream_pointer_follows_the_active_stream():
+    """The launch must go to the CURRENT stream, not the first one ever seen.
+
+    The pointer was cached with no key, so a caller on a non-default stream had
+    every later launch land on the wrong one -- a race, not an error.
+    """
+    from jit_util_mxfp4_a5 import current_stream_ptr
+
+    default = current_stream_ptr().value
+    side = torch.npu.Stream()
+    with torch.npu.stream(side):
+        assert current_stream_ptr().value != default, "stale cached stream"
+    assert current_stream_ptr().value == default
 
 
-def test_nibble_order_is_pinned(quant_default):
+def test_tiling_invariants():
+    """Every derived shape the wrapper and kernel both depend on, in one place.
+
+    rows_for must back off from the naive quotient: 768 = 32*24, so
+    TILE_ELEMS // 768 is 21 rows, but 21*768 is not a whole grain and its scale
+    row would not be a legal DMA. row_quantum is a CONSERVATIVE bound -- the
+    32-byte scale-row rule binds the tile type's compile-time Cols, not the
+    runtime valid extent, so this does not assert that property of it.
+    """
+    for k in SUPPORTED_K:
+        tile, quantum = rows_for(k) * k, row_quantum(k)
+        assert tile % TILE_GRAIN == 0, f"k={k}: tile {tile} is not a whole grain"
+        assert (tile // MX_BLOCK) % 32 == 0, f"k={k}: scale row is not legal DMA"
+        assert tile <= TILE_ELEMS, f"k={k}: tile {tile} exceeds TILE_ELEMS"
+        assert 1 <= quantum <= rows_for(k), f"k={k}: bad quantum {quantum}"
+    assert rows_for(768) == 20, "768 must back off from the naive 21"
+    assert rows_for(96) == 160 and rows_for(3584) == 4
+    assert row_quantum(64) == 16 and row_quantum(4096) == 1
+
+
+def test_nibble_order_is_pinned(default_quantizer):
     """One block of known codes, asserted exactly. No auto-fitting."""
-    x = torch.zeros((rows_for(K), K), dtype=torch.bfloat16)
-    x[0, 0], x[0, 1], x[0, 31] = 1.0, 2.0, 6.0
-    q, s = quant_default(x.npu())
-    sync()
-    assert int(s.cpu().numpy()[0, 0]) == 127, "amax=6.0 must give scale byte 127"
-    assert int(q.cpu().numpy()[0, 0]) == 0x42, "element 0 must be the low nibble"
+    tensor = torch.zeros((rows_for(K), K), dtype=torch.bfloat16)
+    tensor[0, 0], tensor[0, 1], tensor[0, 31] = 1.0, 2.0, 6.0
+    nibbles, scales = default_quantizer(tensor.npu())
+    synchronize()
+    assert int(scales.cpu().numpy()[0, 0]) == 127, "amax=6.0 must give scale byte 127"
+    assert int(nibbles.cpu().numpy()[0, 0]) == 0x42, "element 0 must be the low nibble"
 
 
 ADVERSARIAL = {
@@ -197,25 +231,25 @@ ADVERSARIAL = {
 
 
 @pytest.mark.parametrize("name", sorted(ADVERSARIAL))
-def test_adversarial_blocks(quant_default, name):
+def test_adversarial_blocks(default_quantizer, name):
     """Random N(0,1) reaches none of these, which is why they are enumerated."""
-    values = ADVERSARIAL[name]
-    x = torch.zeros((rows_for(K), K), dtype=torch.bfloat16)
-    for i, v in enumerate(values):
-        blk = (i % (K // MX_BLOCK)) * MX_BLOCK
-        x[0, blk : blk + MX_BLOCK] = v
-        if len(values) > 1:
-            x[0, blk + 1] = v / 2.0
-    run_and_compare(quant_default, x.npu(), name)
+    family = ADVERSARIAL[name]
+    tensor = torch.zeros((rows_for(K), K), dtype=torch.bfloat16)
+    for index, value in enumerate(family):
+        block_start = (index % (K // MX_BLOCK)) * MX_BLOCK
+        tensor[0, block_start : block_start + MX_BLOCK] = value
+        if len(family) > 1:
+            tensor[0, block_start + 1] = value / 2.0
+    run_and_compare(default_quantizer, tensor.npu(), name)
 
 
-def test_output_is_nontrivial(quant_default):
+def test_output_is_nontrivial(default_quantizer):
     """Two different inputs must give two different outputs."""
     outs = []
     for seed in (11, 12):
-        q, s = quant_default(make_bf16(rows_for(K), K, seed))
-        sync()
-        outs.append((q.cpu().numpy().copy(), s.cpu().numpy().copy()))
+        nibbles, scales = default_quantizer(make_bf16(rows_for(K), K, seed))
+        synchronize()
+        outs.append((nibbles.cpu().numpy().copy(), scales.cpu().numpy().copy()))
     for what, a, b in (
         ("q", outs[0][0], outs[1][0]),
         ("scale", outs[0][1], outs[1][1]),
@@ -223,21 +257,21 @@ def test_output_is_nontrivial(quant_default):
         assert not np.array_equal(a, b), f"{what} same for both inputs: did not run"
 
 
-def test_quantization_quality(quant_default):
+def test_quantization_quality(default_quantizer):
     """Relative RMSE and R-squared, not max error alone."""
-    x = make_bf16(1024, K, 13)
-    q, s = quant_default(x)
-    sync()
-    packed, rows, nblk = q.cpu().numpy(), x.shape[0], K // MX_BLOCK
+    tensor = make_bf16(1024, K, 13)
+    nibbles, scales = default_quantizer(tensor)
+    synchronize()
+    packed, rows, nblk = nibbles.cpu().numpy(), tensor.shape[0], K // MX_BLOCK
     codes = np.empty((rows, K), dtype=np.uint8)
     codes[:, 0::2], codes[:, 1::2] = packed & 0x0F, packed >> 4
     mag = E2M1_GRID[codes & 0x07]
     signed = np.where((codes & 0x08) != 0, -mag, mag)
-    scale = np.exp2(s.cpu().numpy().astype(np.float64) - 127.0)
+    scale = np.exp2(scales.cpu().numpy().astype(np.float64) - 127.0)
     recon = (signed.reshape((rows, nblk, MX_BLOCK)) * scale[:, :, None]).reshape(
         rows, K
     )
-    original = x.float().cpu().numpy().astype(np.float64)
+    original = tensor.float().cpu().numpy().astype(np.float64)
     mse = float(np.mean((recon - original) ** 2))
     rmse_rel = mse**0.5 / (float(np.sqrt(np.mean(original**2))) or 1.0)
     r2 = 1.0 - mse / float(np.var(original))
@@ -248,30 +282,32 @@ def test_quantization_quality(quant_default):
     assert r2 > 0.9, f"R^2 {r2:.4f} too low for MXFP4"
 
 
-@pytest.mark.parametrize("bad_k", [0, 32, 96, 8192])
+# 32 and 160 are multiples of MX_BLOCK with no instantiation; 4864 is a real model
+# width no row count can tile at this TILE_ELEMS; 16384 exceeds it outright.
+@pytest.mark.parametrize("bad_k", [0, 32, 160, 4864, 16384])
 def test_unsupported_row_width_is_rejected(bad_k):
     # The dispatching launcher's default case is a silent no-op, so an unvalidated
     # k returns an untouched output buffer rather than failing.
     with pytest.raises(ValueError):
         build_and_load(k=bad_k, verbose=False)
     with pytest.raises(ValueError):
-        load_lib(compile_kernel(verbose=False), k=bad_k)
+        load_quantizer(compile_kernel(verbose=False), k=bad_k)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
-def test_wrong_dtype_is_rejected(quant_default, dtype):
-    x = torch.zeros((rows_for(K), K), dtype=dtype).npu()
+def test_wrong_dtype_is_rejected(default_quantizer, dtype):
+    tensor = torch.zeros((rows_for(K), K), dtype=dtype).npu()
     with pytest.raises(AssertionError, match="bfloat16"):
-        quant_default(x)
+        default_quantizer(tensor)
 
 
-def test_non_contiguous_is_rejected(quant_default):
+def test_non_contiguous_is_rejected(default_quantizer):
     wide = torch.zeros((rows_for(K), 2 * K), dtype=torch.bfloat16).npu()
     view = wide[:, :K]
     assert not view.is_contiguous(), "test needs a genuinely strided view"
     with pytest.raises(AssertionError, match="contiguous"):
-        quant_default(view)
-    quant_default(view.contiguous())  # same data, accepted
+        default_quantizer(view)
+    default_quantizer(view.contiguous())  # same data, accepted
 
 
 def test_rows_for_matches_kernel():
