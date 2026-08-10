@@ -1,8 +1,7 @@
 // mxfp4_quant_a5 — MXFP4 block quantization on Ascend A5 (dav-c310). A5 only.
 // (batch, K) bf16 -> nibbles (batch, K/2) + scales (batch, K/32), both uint8.
 // Each run of 32 elements shares one E8M0 scale byte and becomes 32 E2M1
-// nibbles. OCP MX v1.0 6.3 Algorithm 1 (FLOOR): scale byte = exponent - 2, and
-// 1/X has exponent field 256 - exponent, both from the same clamped exponent.
+// nibbles, per OCP MX v1.0 6.3 Algorithm 1 (FLOOR).
 #include <pto/pto-inst.hpp>
 #include <type_traits>
 #include <utility>
@@ -10,7 +9,6 @@ using namespace pto;
 
 // Row widths with an instantiation. Also add it to SUPPORTED_K in
 // jit_util_mxfp4_a5.py; test_rows_for_matches_kernel pins the two together.
-// A width is admissible iff RowsFor finds a non-zero row count for it.
 constexpr unsigned SUPPORTED_K[] = {64,   96,   128,  192,  256,  512,  768,
                                     896,  1024, 1152, 1280, 1408, 1536, 1664,
                                     1792, 2048, 2560, 2816, 3072, 3584, 4096,
@@ -50,7 +48,7 @@ struct RowsFor {
 
 #ifdef __CCE_AICORE__
 constexpr unsigned B16_LANES = 128;  // bf16 lanes in one vector register
-// MEASURED: vcgmax on b16 groups 16 lanes, 8 results in lanes 0..7.
+// vcgmax on b16 groups 16 lanes, 8 results in lanes 0..7.
 constexpr unsigned VCGMAX_B16_GROUP = 16;
 constexpr unsigned VCGMAX_B16_RESULTS = B16_LANES / VCGMAX_B16_GROUP;
 static_assert(VCGMAX_B16_RESULTS == 8, "block_abs_max stores with PAT_VL8");
@@ -60,11 +58,10 @@ constexpr unsigned VSTS_ALIGN = 32;
 constexpr unsigned GROUP_PITCH_B16 = VSTS_ALIGN / 2u;  // in b16 elements
 // RULE: vselr indices reach only the low 128 source bytes: 4 groups per gather.
 constexpr unsigned GROUPS_PER_COMPACT = 4;
-constexpr unsigned EVENT_SLOTS = 8;  // size of the event-id array
-// the list below writes 8 ids by hand; a bigger array aliases onto EVENT_ID0
+constexpr unsigned EVENT_SLOTS = 8;
 static_assert(EVENT_SLOTS == 8, "extend buffer_free's initialiser first");
 constexpr unsigned UB_ALIGN = 512;
-// A5 has 256 KB. Device pass only. This kernel is A5-only regardless.
+// A5 has 256 KB.
 constexpr unsigned UB_BYTES = PTO_UBUF_SIZE_BYTES;
 
 // bf16 bit-field constants. bf16 is 1-8-7, so a magnitude's biased exponent is
@@ -78,8 +75,7 @@ constexpr int16_t RECIP_OFFSET = 256;  // 1/X exponent field = 256 - b
 constexpr int16_t B_MIN = 2;
 constexpr int16_t B_MAX = 254;
 
-// RULE: a constexpr function cannot be called from [aicore] code, so this
-// rounding to a UB slot boundary is a value template.
+// RULE: a constexpr function cannot be called from [aicore] code.
 template <unsigned Bytes>
 struct RoundUp {
   static constexpr unsigned value = (Bytes + UB_ALIGN - 1) & ~(UB_ALIGN - 1);
@@ -94,8 +90,7 @@ struct QuantShape {
   static constexpr unsigned q_bytes = tile_elems / 2u;
   static constexpr unsigned scale_bytes = blocks;
 
-  // One "group" is one vcgmax: 8 blocks == 256 elements, which is also what one
-  // pack_nibbles iteration consumes, emitting 128 packed bytes.
+  // One "group" is one vcgmax: 8 blocks == 256 elements.
   static constexpr unsigned groups = blocks / VCGMAX_B16_RESULTS;
   // Round UP: the last bite may be partial. Safe only because the buffers
   // below are sized from these counts, and nothing reads what a partial bite
@@ -132,7 +127,6 @@ struct QuantShape {
   static_assert(TILE_GRAIN == VSTS_ALIGN * MX_BLOCK, "grain != scale DMA row");
   static_assert(tile_elems % TILE_GRAIN == 0, "tile is not a whole grain");
   static_assert(tile_elems % (2u * B16_LANES) == 0, "pack_nibbles wants 256");
-  // every GM move is one row, and a Tile refuses a row under 32 bytes
   static_assert(scale_bytes % VSTS_ALIGN == 0, "scale row is not a legal DMA");
   static_assert(q_bytes % VSTS_ALIGN == 0, "nibble row is not a legal DMA");
   static_assert(in_bytes % VSTS_ALIGN == 0, "input row is not a legal DMA");
@@ -155,8 +149,8 @@ struct QuantShape {
 };
 
 // Byte offsets within a pipeline slot, plus shared scratch. Constexpr
-// *variables*, not functions: a constexpr function cannot be called from
-// [aicore] code, so the slot base is multiplied in at the use site.
+// *variables* for the reason above, so the slot base is multiplied in at
+// the use site.
 template <typename Shape>
 struct SlotOffset {
   static constexpr unsigned input = 0;
@@ -176,8 +170,7 @@ using GmStride = pto::Stride<1, 1, 1, Elems, 1>;
 template <typename T, unsigned Elems>
 using UbTile = Tile<TileType::Vec, T, 1, Elems, BLayout::RowMajor, 1, Elems>;
 // Same tile with a RUNTIME valid column count, zero-filling the rest in UB, for
-// the one partial tile a batch can end on. Kept as a separate type so the
-// full-tile path keeps compile-time extents and no pad-value setup.
+// the one partial tile a batch can end on.
 template <typename T, unsigned Elems>
 using UbTilePart =
     Tile<TileType::Vec, T, 1, Elems, BLayout::RowMajor, 1, DYNAMIC,
@@ -192,8 +185,7 @@ __tf__ static AICORE void block_abs_max(__ubuf__ uint16_t *input,
                                         __ubuf__ uint16_t *maxima) {
   __VEC_SCOPE__ {
     MaskReg all_lanes = pset_b16(PAT_ALL);
-    // PAT_VL8 matches VCGMAX_B16_RESULTS: a pattern predicate, like the rest of
-    // this kernel, rather than the runtime CreatePredicate path.
+    // PAT_VL8 matches VCGMAX_B16_RESULTS
     MaskReg low_eight = pset_b16(PAT_VL8);
     vector_u16 abs_mask;
     vdup(abs_mask, BF16_ABS, all_lanes, MODE_ZEROING);
@@ -208,8 +200,7 @@ __tf__ static AICORE void block_abs_max(__ubuf__ uint16_t *input,
       // sign cleared, so a signed max over the bit patterns IS a magnitude max
       vmax((vector_s16 &)folded, (vector_s16 &)even, (vector_s16 &)odd,
            all_lanes);
-      vcgmax((vector_s16 &)grouped, (vector_s16 &)folded,
-             all_lanes);  // 8 block maxima
+      vcgmax((vector_s16 &)grouped, (vector_s16 &)folded, all_lanes);
       // 32-byte pitch, not 16: see VSTS_ALIGN
       vsts(grouped, maxima + (uint32_t)group * GROUP_PITCH_B16, 0, NORM_B16,
            low_eight);
@@ -220,7 +211,7 @@ __tf__ static AICORE void block_abs_max(__ubuf__ uint16_t *input,
 
 // ------------------------------------------------------ compact_maxima
 // Squeeze out the padding VSTS_ALIGN forces: output byte i takes input byte
-// 2*(i & 0xF0) + (i & 0x0F). The ramp is loop-invariant.
+// 2*(i & 0xF0) + (i & 0x0F).
 template <typename Shape>
 __tf__ static AICORE void compact_maxima(__ubuf__ uint16_t *padded,
                                          __ubuf__ uint16_t *packed) {
@@ -253,11 +244,10 @@ __tf__ static AICORE void compact_maxima(__ubuf__ uint16_t *padded,
   }
 }
 
-// ------------------------------------------------------
-// derive_scales maxima -> E8M0 scale byte + one bf16 reciprocal
-// per block. pack_nibbles reads this array with E2B_B16, whose x16
-// replication matches its pair-granular deinterleave exactly, so no duplication
-// is needed here.
+// -------------------------------------------------------- derive_scales
+// maxima -> E8M0 scale byte + one bf16 reciprocal per block. pack_nibbles
+// reads this array with E2B_B16, whose x16 replication matches its
+// pair-granular deinterleave exactly, so no duplication is needed here.
 template <typename Shape>
 __tf__ static AICORE void derive_scales(__ubuf__ uint16_t *maxima,
                                         __ubuf__ uint16_t *recips_out,
@@ -274,11 +264,9 @@ __tf__ static AICORE void derive_scales(__ubuf__ uint16_t *maxima,
       vshrs(exponent, block_max, BF16_MANT_BITS, all_lanes, MODE_ZEROING);
       vmaxs(exponent, exponent, B_MIN, all_lanes);
       vmins(exponent, exponent, B_MAX, all_lanes);
-      vadds(scale_byte, exponent, E8M0_BIAS_ADJ,
-            all_lanes);  // scale_byte = exponent - 2
+      vadds(scale_byte, exponent, E8M0_BIAS_ADJ, all_lanes);
       vsts(scale_byte, scale_out + (uint32_t)chunk * 64u, 0, PK_B16, all_lanes);
-      vsub(reciprocal, bias, exponent,
-           all_lanes);  // 1/X exponent field = 256 - exponent
+      vsub(reciprocal, bias, exponent, all_lanes);
       vshls(reciprocal, reciprocal, BF16_MANT_BITS, all_lanes, MODE_ZEROING);
       vsts(reciprocal, recips_out + (uint32_t)chunk * B16_LANES, 0, NORM_B16,
            all_lanes);
@@ -287,9 +275,9 @@ __tf__ static AICORE void derive_scales(__ubuf__ uint16_t *maxima,
   }
 }
 
-// ----------------------------------------------------------
-// pack_nibbles Scale, cast, pack -- 256 elements per iteration, no
-// gather. One vcvt puts 64 bytes at byte STRIDE 4, offset chosen by
+// --------------------------------------------------------- pack_nibbles
+// Scale, cast, pack -- 256 elements per iteration, no gather.
+// One vcvt puts 64 bytes at byte STRIDE 4, offset chosen by
 // PART_P0..P3, so converting two halves into offsets 0 and 1, OR-ing, and
 // storing with PK_B32 (keeps the low 2 bytes of each 4-byte group) writes 128
 // CONTIGUOUS bytes. RULE: fp4 packs two elements per byte, so DINTLV_B16 would
@@ -477,10 +465,9 @@ inline uint32_t rows_for_k(uint32_t k, std::index_sequence<Idx...>) {
   ((k == SUPPORTED_K[Idx] ? (void)(rows = RowsFor<SUPPORTED_K[Idx]>::value)
                           : (void)0),
    ...);
-  return rows;  // 0 for an unsupported k; the host raises on that
+  return rows;  // 0 for an unsupported k
 }
 
-// So the host does not have to restate the tiling rule.
 extern "C" uint32_t mxfp4_rows_for(uint32_t k) {
   return rows_for_k(k, std::make_index_sequence<SUPPORTED_COUNT>{});
 }

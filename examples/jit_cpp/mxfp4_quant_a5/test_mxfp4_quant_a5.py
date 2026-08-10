@@ -1,8 +1,7 @@
 # pylint: disable=wrong-import-position  # imports are guarded by importorskip
 """Correctness for mxfp4_quant_a5, bit-exact against torch_npu.npu_dynamic_mx_quant.
 
-Runs repeat (PTO_DEVICE_REPEATS, default 5, floored at 1). A missing vendor op
-FAILS rather than skipping: a skip is a green suite proving nothing.
+Runs repeat (PTO_DEVICE_REPEATS, default 5, floored at 1).
 """
 
 import os
@@ -29,7 +28,6 @@ from jit_util_mxfp4_a5 import (  # noqa: E402
     rows_for,
 )
 
-# The skill ships the shared helpers; use them rather than hand-rolling.
 _REFERENCE = (
     Path(__file__).resolve().parents[3] / ".skills/testing-pto-kernels/reference"
 )
@@ -106,7 +104,7 @@ def make_bf16(batch, k, seed):
 
 def run_and_compare(kernel, tensor, label):
     want_nibbles, want_scales = vendor_quantize(tensor)
-    # repeat: a synchronize bug is nondeterministic, so one clean pass proves little
+    # a synchronize bug is nondeterministic, so repeat rather than trust one pass
     for attempt in range(repeats()):
         nibbles, scales = kernel(tensor)
         synchronize()
@@ -127,9 +125,9 @@ def default_quantizer():
 
 
 # 1000 and 4097 do not fill a whole number of tiles, so they exercise the kernel's
-# partial-tile tail; 65536 is more logical work than physical cores (skill: shape
-# coverage). None of these reaches the host padding path -- row_quantum is 1 at
-# this K, so nothing is ever padded. See test_host_padding_path for that.
+# partial-tile tail; 65536 is more logical work than physical cores. None of
+# these reaches the host padding path -- row_quantum is 1 at this K. See
+# test_host_padding_path for that.
 @pytest.mark.parametrize("batch", [1, 7, 33, 64, 128, 1000, 4097, 12345, 65536])
 def test_matches_vendor(default_quantizer, batch):
     run_and_compare(default_quantizer, make_bf16(batch, K, batch), f"batch={batch}")
@@ -157,9 +155,8 @@ def test_matches_vendor_at_row_width(k):
 def test_partial_last_tile(k):
     """A batch that does NOT fill its last tile, so the kernel's tail runs.
 
-    Every other shape test uses whole tiles, so the tail would look correct by
-    never running. A multiple of row_quantum, so this is the kernel's tail and
-    not the host's zero-fill.
+    A multiple of row_quantum, so this is the kernel's tail, not the host's
+    zero-fill.
     """
     rows, quantum = rows_for(k), row_quantum(k)
     # smallest multiple of quantum past three whole tiles; quantum does not
@@ -174,11 +171,7 @@ def test_partial_last_tile(k):
 
 
 def test_stream_pointer_follows_the_active_stream():
-    """The launch must go to the CURRENT stream, not the first one ever seen.
-
-    The pointer was cached with no key, so a caller on a non-default stream had
-    every later launch land on the wrong one -- a race, not an error.
-    """
+    """The launch must go to the CURRENT stream, not the first one seen."""
     from jit_util_mxfp4_a5 import current_stream_ptr
 
     default = current_stream_ptr().value
@@ -286,8 +279,6 @@ def test_quantization_quality(default_quantizer):
 # width no row count can tile at this TILE_ELEMS; 16384 exceeds it outright.
 @pytest.mark.parametrize("bad_k", [0, 32, 160, 4864, 16384])
 def test_unsupported_row_width_is_rejected(bad_k):
-    # The dispatching launcher's default case is a silent no-op, so an unvalidated
-    # k returns an untouched output buffer rather than failing.
     with pytest.raises(ValueError):
         build_and_load(k=bad_k, verbose=False)
     with pytest.raises(ValueError):

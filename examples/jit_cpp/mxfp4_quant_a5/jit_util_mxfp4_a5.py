@@ -17,8 +17,7 @@ VECTOR_CORES = 64  # overridden by a device query where available
 TILE_ELEMS = 16384  # must match TILE_ELEMS in the kernel
 DMA_ALIGN = 32  # a Tile refuses a transfer whose row is under 32 bytes
 TILE_GRAIN = DMA_ALIGN * MX_BLOCK  # must match TILE_GRAIN in the kernel
-# Widths with an instantiation; mirrors SUPPORTED_K in the kernel. Split string
-# for the same reason as FIXED_FLAGS below: black leaves it alone.
+# Widths with an instantiation; mirrors SUPPORTED_K in the kernel.
 SUPPORTED_K = tuple(
     int(k)
     for k in (
@@ -38,8 +37,7 @@ KERNEL_ARGS = [
     ctypes.c_uint32,
 ]
 
-# Flags that never vary. Written as one string and split: black re-explodes a list
-# of short strings to one bind_launcher per line, but leaves this alone.
+# Flags that never vary; one string so black leaves the wrapping alone.
 FIXED_FLAGS = (
     "-O2 -std=c++17 -fPIC -Wno-ignored-attributes -Wno-macro-redefined "
     "-mllvm -cce-aicore-stack-size=0x8000 "
@@ -114,11 +112,10 @@ def bind_launcher(so_path, name, argtypes=None):
 def current_stream_ptr():
     """Raw pointer for the ACTIVE stream, resolved per launch.
 
-    MEASURED: caching it globally sent every launch after the first to whichever
-    stream was current first -- a race, not an error. But current_stream() costs
-    8.9 us against a ~12 us launch floor and halved throughput below batch 4096.
-    The raw accessor is 0.25 us, gives the identical pointer, and does follow a
-    `with torch.npu.stream(...)` block.
+    Never cached: a cached pointer sends later launches to whichever stream
+    was current first -- a race, not an error. The raw accessor is used instead
+    of current_stream() because it is far cheaper and follows a
+    `with torch.npu.stream(...)` block identically.
     """
     import torch
     import torch_npu
