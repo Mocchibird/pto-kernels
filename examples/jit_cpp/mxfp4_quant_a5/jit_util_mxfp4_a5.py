@@ -13,7 +13,7 @@ SRC = HERE / "mxfp4_quant_a5.cpp"
 
 K = 4096  # default row width when a caller does not choose
 MX_BLOCK = 32
-VECTOR_CORES = 64  # overridden by a device query where available
+VECTOR_CORES = 64  # vector cores on an A5
 TILE_ELEMS = 16384  # must match TILE_ELEMS in the kernel
 DMA_ALIGN = 32  # a Tile refuses a transfer whose row is under 32 bytes
 TILE_GRAIN = DMA_ALIGN * MX_BLOCK  # must match TILE_GRAIN in the kernel
@@ -75,8 +75,8 @@ def rows_for(k: int = K) -> int:
 def row_quantum(k: int = K) -> int:
     """Rows the batch must be a multiple of before the wrapper pads.
 
-    The kernel takes a partial last tile, so this is a conservative DMA bound and
-    no longer the tile height.
+    A conservative DMA bound, not the tile height: the kernel takes a partial
+    last tile.
     """
     return max(1, DMA_ALIGN * MX_BLOCK // check_row_width(k))
 

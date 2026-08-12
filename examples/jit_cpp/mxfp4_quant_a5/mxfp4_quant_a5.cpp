@@ -451,7 +451,8 @@ inline void launch_for_k(uint32_t block_dim, void *stream, uint8_t *input,
    ...);
 }
 
-// An unsupported k is a silent no-op; the host validates (check_k).
+// An unsupported k is a silent no-op; the host validates
+// (check_row_width).
 extern "C" void call_mxfp4_quant(uint32_t block_dim, void *stream,
                                  uint8_t *input, uint8_t *nibbles,
                                  uint8_t *scales, uint32_t batch, uint32_t k) {

@@ -52,19 +52,11 @@ def synchronize() -> None:
     (demo.synchronize_device if demo else torch.npu.synchronize)()
 
 
-def vector_cores() -> int:
-    """Query the device; A5 SKUs differ in vector core count."""
-    try:
-        return demo.vector_core_count("npu:0") if demo else 64
-    except Exception:  # pragma: no cover - query failure
-        return 64
-
-
 def fail_without_vendor(why: str):
-    """Losing the reference must FAIL, not skip: it is the whole correctness gate.
+    """Fail, not skip, when the reference is missing.
 
-    PTO_ALLOW_NO_VENDOR=1 downgrades to a skip, for a machine that really lacks
-    the operator -- deliberately, and visibly in the run command.
+    PTO_ALLOW_NO_VENDOR=1 downgrades to a skip, for a machine that lacks the
+    operator.
     """
     if os.environ.get("PTO_ALLOW_NO_VENDOR") == "1":
         pytest.skip(f"{why} (PTO_ALLOW_NO_VENDOR=1)")
@@ -90,7 +82,7 @@ def vendor_quantize(tensor):
     wide = scales.cpu().numpy().reshape(batch, -1)
     assert wide.shape[1] in (blocks, -(-blocks // 2) * 2), (
         f"unexpected vendor scale width {wide.shape[1]} for k={k} "
-        f"(blocks={blocks}); the layout assumption no longer holds"
+        f"(blocks={blocks}); the vendor scale layout changed"
     )
     return nibbles.cpu().numpy().reshape(batch, k // 2), wide[:, :blocks]
 
@@ -104,7 +96,6 @@ def make_bf16(batch, k, seed):
 
 def run_and_compare(kernel, tensor, label):
     want_nibbles, want_scales = vendor_quantize(tensor)
-    # a synchronize bug is nondeterministic, so repeat rather than trust one pass
     for attempt in range(repeats()):
         nibbles, scales = kernel(tensor)
         synchronize()
@@ -121,7 +112,7 @@ def run_and_compare(kernel, tensor, label):
 
 @pytest.fixture(scope="module")
 def default_quantizer():
-    return build_and_load(vector_cores=vector_cores(), verbose=False)
+    return build_and_load(verbose=False)
 
 
 # 1000 and 4097 do not fill a whole number of tiles, so they exercise the kernel's
@@ -141,13 +132,13 @@ def test_host_padding_path(k):
     assert quantum > 1, f"k={k} never pads; this test needs a narrower width"
     batch = 2 * rows_for(k) + quantum - 1
     assert batch % quantum, "a multiple would skip the padding path entirely"
-    kernel = build_and_load(vector_cores=vector_cores(), k=k, verbose=False)
+    kernel = build_and_load(k=k, verbose=False)
     run_and_compare(kernel, make_bf16(batch, k, batch), f"k={k} padded")
 
 
 @pytest.mark.parametrize("k", SUPPORTED_K)
 def test_matches_vendor_at_row_width(k):
-    kernel = build_and_load(vector_cores=vector_cores(), k=k, verbose=False)
+    kernel = build_and_load(k=k, verbose=False)
     run_and_compare(kernel, make_bf16(4 * rows_for(k), k, k), f"k={k}")
 
 
@@ -166,7 +157,7 @@ def test_partial_last_tile(k):
         batch += quantum
     assert batch % rows, f"k={k}: batch {batch} fills whole tiles, no tail"
     assert batch % quantum == 0, f"k={k}: would pad, hiding the kernel tail"
-    kernel = build_and_load(vector_cores=vector_cores(), k=k, verbose=False)
+    kernel = build_and_load(k=k, verbose=False)
     run_and_compare(kernel, make_bf16(batch, k, batch), f"k={k} tail")
 
 
@@ -184,11 +175,9 @@ def test_stream_pointer_follows_the_active_stream():
 def test_tiling_invariants():
     """Every derived shape the wrapper and kernel both depend on, in one place.
 
-    rows_for must back off from the naive quotient: 768 = 32*24, so
-    TILE_ELEMS // 768 is 21 rows, but 21*768 is not a whole grain and its scale
-    row would not be a legal DMA. row_quantum is a CONSERVATIVE bound -- the
-    32-byte scale-row rule binds the tile type's compile-time Cols, not the
-    runtime valid extent, so this does not assert that property of it.
+    row_quantum is a conservative bound: the 32-byte scale-row rule binds the
+    tile type's compile-time Cols, not the runtime valid extent, so this does not
+    assert that property of it.
     """
     for k in SUPPORTED_K:
         tile, quantum = rows_for(k) * k, row_quantum(k)
@@ -225,7 +214,7 @@ ADVERSARIAL = {
 
 @pytest.mark.parametrize("name", sorted(ADVERSARIAL))
 def test_adversarial_blocks(default_quantizer, name):
-    """Random N(0,1) reaches none of these, which is why they are enumerated."""
+    """Values random N(0,1) never reaches."""
     family = ADVERSARIAL[name]
     tensor = torch.zeros((rows_for(K), K), dtype=torch.bfloat16)
     for index, value in enumerate(family):
@@ -302,7 +291,7 @@ def test_non_contiguous_is_rejected(default_quantizer):
 
 
 def test_rows_for_matches_kernel():
-    """rows_for() is stated in Python (the padding wrapper needs it before any .so"""
+    """The host rows_for() must agree with the kernel's RowsFor<K>."""
     query = kernel_rows_for(compile_kernel(verbose=False))
     mismatched = {
         k: (rows_for(k), query(k)) for k in SUPPORTED_K if rows_for(k) != query(k)
