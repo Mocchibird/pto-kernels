@@ -162,7 +162,7 @@ def measure(k, batch):
                 lambda x: vendor(x, dst_type=VENDOR_DST_TYPE),
             )
         )
-    rows.append(("d2d_copy", 0, COPY_BYTES_PER_ELEM, lambda x: dst.copy_(x)))
+    rows.append(("d2d_copy", 0, COPY_BYTES_PER_ELEM, dst.copy_))
 
     # One interleaved pass over every contender, so each bracket sees the same
     # machine and the paired ratio below is meaningful.
@@ -174,26 +174,26 @@ def measure(k, batch):
         )
     except Exception as exc:  # a vendor op may reject an unusual shape
         return [
-            dict(
-                k=k,
-                batch=batch,
-                contender=label,
-                allocates=allocates,
-                bytes_per_elem=per_elem,
-                pool=len(pool),
-                elems_mi=round(batch * k / 2**20, 1),
-                footprint_mib=round(footprint, 1),
-                micros=0.0,
-                p_lo=0.0,
-                p_hi=0.0,
-                spread_pct=0.0,
-                gbs=0.0,
-                speedup=0.0,
-                speedup_lo=0.0,
-                speedup_hi=0.0,
-                resolved=0,
-                status=f"error:{type(exc).__name__}",
-            )
+            {
+                "k": k,
+                "batch": batch,
+                "contender": label,
+                "allocates": allocates,
+                "bytes_per_elem": per_elem,
+                "pool": len(pool),
+                "elems_mi": round(batch * k / 2**20, 1),
+                "footprint_mib": round(footprint, 1),
+                "micros": 0.0,
+                "p_lo": 0.0,
+                "p_hi": 0.0,
+                "spread_pct": 0.0,
+                "gbs": 0.0,
+                "speedup": 0.0,
+                "speedup_lo": 0.0,
+                "speedup_hi": 0.0,
+                "resolved": 0,
+                "status": f"error:{type(exc).__name__}",
+            }
             for label, allocates, per_elem, _ in rows
         ]
 
@@ -212,27 +212,27 @@ def measure(k, batch):
         else:
             ratio, ratio_lo, ratio_hi, resolved = 1.0, 1.0, 1.0, 0
         out.append(
-            dict(
-                k=k,
-                batch=batch,
-                contender=label,
-                allocates=allocates,
-                bytes_per_elem=per_elem,
-                pool=len(pool),
-                elems_mi=round(batch * k / 2**20, 1),
-                footprint_mib=round(footprint, 1),
-                micros=round(micros, 2),
-                p_lo=round(lo, 2),
-                p_hi=round(hi, 2),
-                spread_pct=round(100.0 * (hi - lo) / micros, 1),
-                gbs=round(gbs, 1),
-                speedup=round(ratio, 4),
-                speedup_lo=round(ratio_lo, 4),
-                speedup_hi=round(ratio_hi, 4),
-                resolved=int(resolved),
-                status="ok",
-                brackets=taken,
-            )
+            {
+                "k": k,
+                "batch": batch,
+                "contender": label,
+                "allocates": allocates,
+                "bytes_per_elem": per_elem,
+                "pool": len(pool),
+                "elems_mi": round(batch * k / 2**20, 1),
+                "footprint_mib": round(footprint, 1),
+                "micros": round(micros, 2),
+                "p_lo": round(lo, 2),
+                "p_hi": round(hi, 2),
+                "spread_pct": round(100.0 * (hi - lo) / micros, 1),
+                "gbs": round(gbs, 1),
+                "speedup": round(ratio, 4),
+                "speedup_lo": round(ratio_lo, 4),
+                "speedup_hi": round(ratio_hi, 4),
+                "resolved": int(resolved),
+                "status": "ok",
+                "brackets": taken,
+            }
         )
     for row in out:
         if row["status"] == "ok":

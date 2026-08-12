@@ -126,4 +126,3 @@ the vendor kernel, not a measurement artifact.
 
 Our own curve is smooth across the same widths, which is why the ratio dips only
 here and at K=1536. Both of those are genuine losses on this toolchain.
-
