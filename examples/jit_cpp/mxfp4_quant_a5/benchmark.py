@@ -1,26 +1,49 @@
-"""Bandwidth benchmark: this kernel vs torch_npu, bf16 -> MXFP4, on Ascend A5.
+"""Bandwidth benchmark for mxfp4_quant_a5: ours vs PTO TQuant and vs torch_npu.
 
-Bandwidth counts every byte the operation must move: `2K` read plus `K/2 + K/32`
-written, i.e. 2.53125 bytes per element. Each contender's own byte count is used.
+Reproduces every figure in README.md. Run it through run_benchmark.sh.
 
-TIMING. LAUNCHES launches fire back to back between two synchronizes and the wall
-clock is divided by LAUNCHES, identically for every contender. These are
-steady-state throughput figures, not single-call latency. Contenders are
-interleaved one bracket at a time, and the reported ratio is the median paired
-per-bracket ratio with a bootstrap 95% interval; a shape whose interval spans 1.0
-is reported as unresolved.
+TWO COMPARISONS, on deliberately different call paths, because pairing arms that
+do not share one measures the wrapper rather than either kernel:
 
-THE K SWEEP USES A FIXED BATCH, so every row answers the question a caller has:
-"at this batch, what do I get at each K?". Total work therefore scales with K,
-and the elems_mi column records it.
+  --pairs raw   ours vs PTO TQuant. Both a bare ctypes launch with preallocated
+                outputs, from THIS source built twice -- the second time with
+                -DMXFP4_TQUANT, which swaps the four compute passes for the
+                vendor tile op and leaves tiling, buffering and every
+                TLOAD/TSTORE identical. So this isolates COMPUTE. Needs PTO
+                9.1.0; on 9.0.0, which has no MXFP4 quantizer, it is skipped.
+  --pairs api   ours vs torch_npu. Both one Python call that allocates its own
+                outputs. torch_npu has no preallocated entry point, so this is
+                the only fair user-facing pairing.
 
-FAIRNESS. Output allocation is its own row: torch_npu allocates inherently, so
-the two allocating rows are the apples-to-apples pair. A device-to-device copy
-row is a roofline bound in the CSV, at 4 B/elem rather than 2.53; verdict() flags
-any contender that reads above it.
+The two `ours` arms differ only in Python -- argument checks, padding arithmetic,
+two allocations and output slicing -- which costs about 2.9x at K=64 and nothing
+by K=2048.
 
-Emits build/mxfp4_kbench.csv (vs K, fixed batch) and build/mxfp4_bbench.csv
-(vs batch, at one K).
+Bandwidth counts every byte the operation must move: 2K read plus K/2 + K/32
+written, i.e. 2.53125 bytes per element, one formula for every arm.
+
+TIMING. BRACKETS brackets per shape; each fires LAUNCHES launches between two
+synchronizes and divides the wall clock by LAUNCHES, identically for every arm.
+These are steady-state throughput figures, not single-call latency. Contenders
+are interleaved one bracket at a time with a ROTATING order: under a fixed order
+the first arm in each bracket absorbs the previous one's cache eviction, which
+alone was enough to make a preallocated arm read slower than an allocating one.
+The reported ratio is the median paired per-bracket ratio with a percentile
+bootstrap 95% interval, and a shape whose interval spans 1.0 is unresolved.
+
+That interval covers variation WITHIN a process only. torch_npu has been seen to
+select a different kernel from one process to the next, so run several processes
+with different --tag values and compare their spread before believing a small
+margin on the api pair.
+
+Every contender is gated bit-exact against torch_npu before it is timed, so a
+wrong kernel cannot report a fast number.
+
+The vendor arm is whatever CANN is on ASCEND_HOME_PATH: torch_npu resolves
+libopapi_nn.so from there, so its numbers move with the toolkit and rows are
+comparable only within one version.
+
+Emits build/pairs_<axis>_<tag>.csv, which is what the plotting scripts read.
 """
 
 import argparse
@@ -30,6 +53,10 @@ import statistics
 import sys
 import time
 from pathlib import Path
+
+import ctypes
+import os
+import subprocess
 
 import torch
 import torch_npu  # noqa: F401  (registers the npu backend)
@@ -45,22 +72,118 @@ BUILDDIR = HERE / "build"
 # the rest are covered by the tests.
 HADAMARD_NS = [32, 64, 128, 256, 512, 1024, 2048]
 K_LIST = [k for k in HADAMARD_NS if k in SUPPORTED_K and (k // MX_BLOCK) % 2 == 0]
-EXCLUDED_K = [k for k in HADAMARD_NS if k not in K_LIST]
 K_SWEEP_BATCH = 65536  # fixed across the K sweep
-BATCHES = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
 BATCH_SWEEP_K = 4096
 WORKING_SET_BYTES = 1024 * 1024 * 1024
 POOL_MIN, POOL_MAX = 2, 64
 LAUNCHES = 40
-BRACKETS = 32
+BRACKETS = 64
 BOOTSTRAP = 2000
 SEED = 20260811
 WARMUP = 5
-MIN_BRACKET_MICROS = 2.0
 VENDOR_DST_TYPE = 296
 
 BYTES_PER_ELEM = 2.0 + 0.5 + 1.0 / MX_BLOCK
-COPY_BYTES_PER_ELEM = 4.0
+
+
+def raw_launcher(so_path, k):
+    """ctypes launcher with no wrapper: the path the TQuant arm also uses."""
+    from jit_util_mxfp4_a5 import VECTOR_CORES, current_stream_ptr
+
+    handle = ctypes.CDLL(str(so_path))
+    launch = handle.call_mxfp4_quant
+    launch.argtypes = [
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+    ]
+    launch.restype = None
+
+    def call(tensor, packed, scales):
+        launch(
+            VECTOR_CORES,
+            current_stream_ptr(),
+            ctypes.c_void_p(tensor.data_ptr()),
+            ctypes.c_void_p(packed.data_ptr()),
+            ctypes.c_void_p(scales.data_ptr()),
+            tensor.shape[0],
+            k,
+        )
+
+    return call
+
+
+class TQuantUnavailable(RuntimeError):
+    """PTO has no MXFP4 quantizer -- it arrived in 9.1.0, so 9.0.0 cannot build."""
+
+
+def build_tquant(k):
+    """Build the kernel with its four compute passes replaced by PTO TQuant."""
+    home = os.environ["ASCEND_HOME_PATH"]
+    out = BUILDDIR / "mxfp4_a5_tquant.so"
+    obj = BUILDDIR / "mxfp4_a5_tquant.o"
+    BUILDDIR.mkdir(parents=True, exist_ok=True)
+    source = HERE / "mxfp4_quant_a5.cpp"
+    flags = (
+        f"-xcce --cce-aicore-arch=dav-c310-vec -DREGISTER_BASE -DMXFP4_TQUANT "
+        f"-std=c++17 -O2 -fPIC -Wno-ignored-attributes -Wno-macro-redefined "
+        f"-mllvm -cce-aicore-stack-size=0x8000 "
+        f"-mllvm -cce-aicore-function-stack-size=0x8000 "
+        f"-mllvm -cce-aicore-addr-transform "
+        f"-mllvm -cce-aicore-dcci-insert-for-scalar=false -Xhost-start -Xhost-end "
+        f"-I{home}/aarch64-linux/include -I{home}/include"
+    ).split()
+    compile_step = subprocess.run(
+        [f"{home}/bin/bisheng", *flags, "-c", str(source), "-o", str(obj)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if compile_step.returncode != 0:
+        raise TQuantUnavailable(compile_step.stderr.strip()[-400:])
+    subprocess.run(
+        [
+            f"{home}/bin/bisheng",
+            "-fPIC",
+            "-shared",
+            "--cce-fatobj-link",
+            f"-Wl,-soname,{out.name}",
+            str(obj),
+            "-o",
+            str(out),
+        ],
+        check=True,
+    )
+    handle = ctypes.CDLL(str(out))
+    launch = handle.call_mxfp4_quant
+    launch.argtypes = [
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+    ]
+    launch.restype = None
+    from jit_util_mxfp4_a5 import VECTOR_CORES, current_stream_ptr
+
+    def call(tensor, packed, scales):
+        launch(
+            VECTOR_CORES,
+            current_stream_ptr(),
+            ctypes.c_void_p(tensor.data_ptr()),
+            ctypes.c_void_p(packed.data_ptr()),
+            ctypes.c_void_p(scales.data_ptr()),
+            tensor.shape[0],
+            k,
+        )
+
+    return call
 
 
 def batch_for(k):
@@ -131,228 +254,157 @@ def paired_speedup(ours, theirs):
     )
 
 
-def verdict(micros, gbs, copy_gbs):
-    if micros < MIN_BRACKET_MICROS:
-        return f"too-fast-to-time({micros:.1f}us)"
-    if copy_gbs and gbs > 1.20 * copy_gbs:
-        return f"above-copy({gbs:.0f}>{copy_gbs:.0f})"
-    return "ok"
-
-
-def measure(k, batch):
-    pool = make_pool(batch, k)
-    footprint = len(pool) * batch * k * 2 / 2**20
-    quant = build_and_load(k=k, verbose=False)
-    q = torch.empty((batch, k // 2), dtype=torch.uint8, device="npu")
-    s = torch.empty((batch, k // MX_BLOCK), dtype=torch.uint8, device="npu")
-    dst = torch.empty((batch, k), dtype=torch.bfloat16, device="npu")
-    torch.npu.synchronize()
-    vendor = getattr(torch_npu, "npu_dynamic_mx_quant", None)
-
-    rows = [
-        ("ours", 0, BYTES_PER_ELEM, lambda x: quant(x, out=(q, s))),
-        ("ours", 1, BYTES_PER_ELEM, quant),
-    ]
-    if vendor is not None:
-        rows.append(
-            (
-                "torch_npu",
-                1,
-                BYTES_PER_ELEM,
-                lambda x: vendor(x, dst_type=VENDOR_DST_TYPE),
-            )
-        )
-    rows.append(("d2d_copy", 0, COPY_BYTES_PER_ELEM, dst.copy_))
-
-    # One interleaved pass over every contender, so each bracket sees the same
-    # machine and the paired ratio below is meaningful.
-    keys = [(label, allocates) for label, allocates, _, _ in rows]
-    try:
-        samples = interleaved_micros(
-            [(f"{label}/{allocates}", call) for label, allocates, _, call in rows],
-            pool,
-        )
-    except Exception as exc:  # a vendor op may reject an unusual shape
-        return [
-            {
-                "k": k,
-                "batch": batch,
-                "contender": label,
-                "allocates": allocates,
-                "bytes_per_elem": per_elem,
-                "pool": len(pool),
-                "elems_mi": round(batch * k / 2**20, 1),
-                "footprint_mib": round(footprint, 1),
-                "micros": 0.0,
-                "p_lo": 0.0,
-                "p_hi": 0.0,
-                "spread_pct": 0.0,
-                "gbs": 0.0,
-                "speedup": 0.0,
-                "speedup_lo": 0.0,
-                "speedup_hi": 0.0,
-                "resolved": 0,
-                "status": f"error:{type(exc).__name__}",
-            }
-            for label, allocates, per_elem, _ in rows
-        ]
-
-    # The apples-to-apples pair: both allocating, which torch_npu must do anyway.
-    base = samples.get("ours/1")
-    out, copy_gbs = [], 0.0
-    for (label, allocates), (_, _, per_elem, _) in zip(keys, rows):
-        taken = samples[f"{label}/{allocates}"]
-        micros = statistics.median(taken)
-        lo, hi = min(taken), max(taken)
-        gbs = batch * k * per_elem / (micros * 1e-6) / 1e9
-        if label == "d2d_copy":
-            copy_gbs = gbs
-        if base is not None and label != "ours":
-            ratio, ratio_lo, ratio_hi, resolved = paired_speedup(base, taken)
-        else:
-            ratio, ratio_lo, ratio_hi, resolved = 1.0, 1.0, 1.0, 0
-        out.append(
-            {
-                "k": k,
-                "batch": batch,
-                "contender": label,
-                "allocates": allocates,
-                "bytes_per_elem": per_elem,
-                "pool": len(pool),
-                "elems_mi": round(batch * k / 2**20, 1),
-                "footprint_mib": round(footprint, 1),
-                "micros": round(micros, 2),
-                "p_lo": round(lo, 2),
-                "p_hi": round(hi, 2),
-                "spread_pct": round(100.0 * (hi - lo) / micros, 1),
-                "gbs": round(gbs, 1),
-                "speedup": round(ratio, 4),
-                "speedup_lo": round(ratio_lo, 4),
-                "speedup_hi": round(ratio_hi, 4),
-                "resolved": int(resolved),
-                "status": "ok",
-                "brackets": taken,
-            }
-        )
-    for row in out:
-        if row["status"] == "ok":
-            row["status"] = verdict(row["micros"], row["gbs"], copy_gbs)
-    pool.clear()
-    torch.npu.empty_cache()
-    return out
-
-
 def write_csv(path, rows):
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
     print(f"wrote {path} ({len(rows)} rows)")
 
 
-def median_of_sweeps(sweep, repeat):
-    """Element-wise median across whole sweeps. Records `repeat` in every row so
-    a plot cannot claim a different number than was actually run."""
-    passes = [sweep() for _ in range(repeat)]
-    keys = ["k", "batch", "contender", "allocates"]
-    merged, pooled = [], {}
-    for base in passes[0]:
-        ident = tuple(base[key] for key in keys)
-        peers = [
-            next(r for r in p if tuple(r[key] for key in keys) == ident) for p in passes
+def gate(name, ours_out, other_out):
+    """Bit-exactness before timing: a fast arm that computes nothing is the
+    signature failure on this part."""
+    (oq, os_), (tq, ts) = ours_out, other_out
+    torch.npu.synchronize()
+    packed = (oq == tq).float().mean().item()
+    scale = (os_ == ts).float().mean().item()
+    wrote = bool(oq.any().item())
+    assert wrote, f"{name}: our arm wrote nothing"
+    return packed, scale, wrote
+
+
+def measure_pair(k, batch, which):
+    """One matched pair, both arms on an identical call path.
+
+    raw   ours_raw vs TQuant -- both a bare ctypes launch into the same source
+          built twice, outputs preallocated. Only the four compute passes differ,
+          so this isolates COMPUTE.
+    api   ours vs torch_npu -- both one Python call that allocates its own
+          outputs, which is what a caller actually gets. torch_npu has no other
+          mode, so this is the only fair user-facing pairing.
+    """
+    from jit_util_mxfp4_a5 import compile_kernel
+
+    pool = make_pool(batch, k)
+    blocks = k // MX_BLOCK
+    if which == "raw":
+        qa = torch.empty((batch, k // 2), dtype=torch.uint8, device="npu")
+        sa = torch.empty((batch, blocks), dtype=torch.uint8, device="npu")
+        qb = torch.empty((batch, k // 2), dtype=torch.uint8, device="npu")
+        sb = torch.empty((batch, blocks), dtype=torch.uint8, device="npu")
+        mine = raw_launcher(compile_kernel(verbose=False), k)
+        theirs = build_tquant(k)
+        contenders = [
+            ("ours_raw", lambda x: mine(x, qa, sa)),
+            ("tquant", lambda x: theirs(x, qb, sb)),
         ]
-        row = dict(base)
-        for col in ("micros", "p_lo", "p_hi", "spread_pct", "gbs"):
-            row[col] = round(statistics.median(float(r[col]) for r in peers), 2)
-        row["status"] = next((r["status"] for r in peers if r["status"] != "ok"), "ok")
-        row["sweeps"] = repeat
-        # every bracket from every sweep, so the ratio below covers run-to-run
-        # drift and not just the within-process spread of one sweep
-        pooled[ident] = [b for r in peers for b in r["brackets"]]
-        merged.append(row)
+        mine(pool[0], qa, sa)
+        theirs(pool[0], qb, sb)
+        match = gate("raw", (qa, sa), (qb, sb))
+    else:
+        quant = build_and_load(k=k, verbose=False)
+        vendor = getattr(torch_npu, "npu_dynamic_mx_quant", None)
+        if vendor is None:
+            raise RuntimeError("npu_dynamic_mx_quant missing: no baseline")
+        contenders = [
+            ("ours", quant),
+            ("torch_npu", lambda x: vendor(x, dst_type=VENDOR_DST_TYPE)),
+        ]
+        oq, os_ = quant(pool[0])
+        tq, ts = vendor(pool[0], dst_type=VENDOR_DST_TYPE)
+        ts = ts.reshape(ts.shape[0], -1)[:, :blocks]
+        match = gate("api", (oq, os_), (tq, ts))
 
-    for row in merged:
-        base_ident = (row["k"], row["batch"], "ours", 1)
-        samples = pooled.get(base_ident)
-        mine = pooled[tuple(row[key] for key in keys)]
-        if samples is None or row["contender"] == "ours":
-            ratio, low, high, resolved = 1.0, 1.0, 1.0, 0
-        else:
-            ratio, low, high, resolved = paired_speedup(samples, mine)
-        row["speedup"] = round(ratio, 4)
-        row["speedup_lo"] = round(low, 4)
-        row["speedup_hi"] = round(high, 4)
-        row["resolved"] = int(resolved)
-        del row["brackets"]
-    return merged
-
-
-def report(rows, axis, keys):
-    print(
-        f"\n  {'shape':<22}{'ours(prealloc)':>16}{'ours':>10}{'torch':>10}"
-        f"{'ratio':>8}{'copy':>8}{'spread':>8}"
-    )
-    for key in keys:
-        got = {(r["contender"], r["allocates"]): r for r in rows if r[axis] == key}
-        pre = got.get(("ours", 0))
-        ours = got.get(("ours", 1))
-        ven = got.get(("torch_npu", 1))
-        cp = got.get(("d2d_copy", 0))
-        if not (pre and ours):
-            continue
-        label = (
-            f"{axis}={key} ({pre['elems_mi']:.0f}M el)"
-            if axis == "k"
-            else f"batch={key}"
+    samples = interleaved_micros(contenders, pool)
+    first, second = contenders[0][0], contenders[1][0]
+    ratio, low, high, resolved = paired_speedup(samples[first], samples[second])
+    rows = []
+    for name in (first, second):
+        taken = samples[name]
+        micros = statistics.median(taken)
+        rows.append(
+            {
+                "pair": which,
+                "k": k,
+                "batch": batch,
+                "contender": name,
+                "micros": round(micros, 3),
+                "p_lo": round(min(taken), 3),
+                "p_hi": round(max(taken), 3),
+                "spread_pct": round(100 * (max(taken) - min(taken)) / micros, 1),
+                "gbs": round(batch * k * BYTES_PER_ELEM / (micros * 1e-6) / 1e9, 1),
+                "packed_match": round(match[0], 6),
+                "scale_match": round(match[1], 6),
+                "speedup": round(ratio, 4) if name == second else 1.0,
+                "speedup_lo": round(low, 4) if name == second else 1.0,
+                "speedup_hi": round(high, 4) if name == second else 1.0,
+                "resolved": int(resolved) if name == second else 0,
+                "brackets_n": len(taken),
+                "status": "ok",
+            }
         )
-        ratio = f"{ours['gbs'] / ven['gbs']:.3f}" if ven and ven["gbs"] else "-"
-        print(
-            f"  {label:<22}{pre['gbs']:>16.0f}{ours['gbs']:>10.0f}"
-            f"{(ven['gbs'] if ven else 0):>10.0f}{ratio:>8}"
-            f"{(cp['gbs'] if cp else 0):>8.0f}{ours['spread_pct']:>7.1f}%"
-        )
+    pool.clear()
+    torch.npu.empty_cache()
+    return rows
+
+
+def tquant_builds():
+    """Report whether the TQuant variant compiles, so the arm can be skipped."""
+    try:
+        build_tquant(K_LIST[0])
+        return True
+    except TQuantUnavailable as exc:
+        print(f"skipping the raw pair: PTO here has no MXFP4 quantizer\n  {exc}")
+        return False
 
 
 def main():
-    parser = argparse.ArgumentParser(description="MXFP4 bandwidth benchmark.")
-    parser.add_argument("--repeat", type=int, default=3)
-    parser.add_argument("--batch-sweep", action="store_true")
+    parser = argparse.ArgumentParser(description="two matched-path comparisons")
+    parser.add_argument(
+        "--tag", default="1", help="suffix for the CSV; use one per process"
+    )
+    parser.add_argument("--axis", choices=["k", "batch"], default="k")
+    parser.add_argument("--pairs", default="raw,api", help="which pairs to run")
+    parser.add_argument("--ks", default="", help="comma list overriding K_LIST")
     args = parser.parse_args()
 
-    if getattr(torch_npu, "npu_dynamic_mx_quant", None) is None:
-        print("warning: npu_dynamic_mx_quant absent; no vendor row", file=sys.stderr)
-
-    print(
-        f"=== K sweep at fixed batch {K_SWEEP_BATCH}, "
-        f"median of {args.repeat} sweeps ==="
+    # PR 221 sweeps ROWS PER LAUNCH over this list at a fixed width. Only 4096
+    # and 8192 of those values are legal K here (SUPPORTED_K stops at 14336), so
+    # the larger ones are the batch axis, not widths.
+    pr221_batches = (4096, 8192, 16384, 32768, 65536, 131072)
+    widths = tuple(int(v) for v in args.ks.split(",")) if args.ks else K_LIST
+    for w in widths:
+        assert w in SUPPORTED_K, f"K={w} has no instantiation"
+    shapes = (
+        [(k, batch_for(k)) for k in widths]
+        if args.axis == "k"
+        else [(BATCH_SWEEP_K, b) for b in pr221_batches]
     )
-    krows = median_of_sweeps(
-        lambda: [r for k in K_LIST for r in measure(k, batch_for(k))], args.repeat
-    )
-    report(krows, "k", K_LIST)
-    write_csv(BUILDDIR / "mxfp4_kbench.csv", krows)
+    label = "K" if args.axis == "k" else "batch"
 
-    if args.batch_sweep:
+    out = []
+    for which in args.pairs.split(","):
+        if which == "raw" and not tquant_builds():
+            continue
+        print(f"\n=== {which} pair, by {label} ===")
         print(
-            f"\n=== batch sweep at K={BATCH_SWEEP_K}, "
-            f"median of {args.repeat} sweeps ==="
+            f"{label:>7} {'ours':>8} {'other':>8} {'ratio':>7} {'95% CI':>16} {'res':>4}"
         )
-        brows = median_of_sweeps(
-            lambda: [r for b in BATCHES for r in measure(BATCH_SWEEP_K, b)],
-            args.repeat,
-        )
-        report(brows, "batch", BATCHES)
-        write_csv(BUILDDIR / "mxfp4_bbench.csv", brows)
-
-    flagged = [r for r in krows if r["status"] != "ok"]
-    print(f"\n  rows flagged: {len(flagged)}")
-    for row in flagged[:10]:
-        print(f"    K={row['k']} {row['contender']}: {row['status']}")
-    live = [r for r in krows if r["gbs"]]
-    print(f"  worst bracket spread: {max(r['spread_pct'] for r in live):.1f}%")
-    print("BENCH DONE")
+        for width, batch in shapes:
+            rows = measure_pair(width, batch, which)
+            out += rows
+            a, b = rows[0], rows[1]
+            key = width if args.axis == "k" else batch
+            print(
+                f"{key:>7} {a['gbs']:>8.0f} {b['gbs']:>8.0f} {b['speedup']:>7.3f} "
+                f"[{b['speedup_lo']:.3f}, {b['speedup_hi']:.3f}]"
+                f"{'yes' if b['resolved'] else 'NO':>5}"
+            )
+    write_csv(BUILDDIR / f"pairs_{args.axis}_{args.tag}.csv", out)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

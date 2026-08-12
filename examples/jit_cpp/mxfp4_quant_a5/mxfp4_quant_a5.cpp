@@ -122,6 +122,24 @@ struct QuantShape {
   static constexpr unsigned ub_needed =
       scratch_base + aligned_max + aligned_packed + aligned_mult;
 
+#ifdef MXFP4_TQUANT
+  // TQuant reads its per-block maxima a whole register at a time, so the span
+  // rounds up to b_iters registers, and its reducer flushes one 32-byte block
+  // past the last group.
+  static constexpr unsigned tquant_max_elems = b_iters * B16_LANES;
+  static constexpr unsigned tquant_max_bytes =
+      tquant_max_elems * 2u + VSTS_ALIGN;
+  static constexpr unsigned tquant_scaling_bytes = blocks * 2u;
+  static_assert(tquant_max_bytes <= aligned_max,
+                "TQuant maxima do not fit the maxima region");
+  static_assert(tquant_scaling_bytes <= aligned_mult,
+                "TQuant scaling does not fit the reciprocal region");
+  // numGroups truncates inside TQuant, and a partial 8-group window takes a
+  // different store path.
+  static_assert(tile_elems % MX_BLOCK == 0, "TQuant would drop a group");
+  static_assert(blocks % 8u == 0, "TQuant would take its vstus tail path");
+#endif
+
   static_assert(Rows > 0, "no Rows makes Rows*K a whole TILE_GRAIN: bad K");
   static_assert(K % MX_BLOCK == 0, "a block may not straddle a row boundary");
   static_assert(TILE_GRAIN == VSTS_ALIGN * MX_BLOCK, "grain != scale DMA row");
@@ -317,6 +335,44 @@ __tf__ static AICORE void pack_nibbles(__ubuf__ uint16_t *input,
   }
 }
 
+#ifdef MXFP4_TQUANT
+// Requires PTO 9.1.0: 9.0.0 has no MXFP4 quantizer. Included here, not at file
+// scope, because this region is inside the device-pass guard.
+#include <pto/npu/a5/TQuant.hpp>
+
+// ------------------------------------------------------- tquant_passes
+// One vendor tile op in place of block_abs_max, compact_maxima, derive_scales
+// and pack_nibbles. validCols is tile_elems even on the partial tile: the load
+// already zero-fills the pad, and a short validCols would send TQuant's own
+// ZeroPadSourceTile over the input slot. Offsets::packed is left allocated and
+// unused, since reclaiming it would move slot_stride.
+template <typename Shape>
+inline AICORE void tquant_passes(uint32_t input_offset, uint32_t nibble_offset,
+                                 uint32_t scale_offset) {
+  static_assert(sizeof(float4_e2m1x2_t) == 1,
+                "the nibble tile assumes one byte per float4_e2m1x2_t");
+  static_assert(REPEAT_BYTE / sizeof(bfloat16_t) == B16_LANES,
+                "tquant_max_elems assumes a 128-lane b16 vector");
+  UbTile<bfloat16_t, Shape::tile_elems> source;
+  UbTile<float4_e2m1x2_t, Shape::q_bytes> nibbles;
+  UbTile<uint8_t, Shape::scale_bytes> scales;
+  UbTile<bfloat16_t, Shape::tquant_max_elems> block_max;
+  UbTile<bfloat16_t, Shape::blocks> reciprocal;
+  TASSIGN(source, input_offset);
+  TASSIGN(nibbles, nibble_offset);
+  TASSIGN(scales, scale_offset);
+  TASSIGN(block_max, SlotOffset<Shape>::maxima);
+  TASSIGN(reciprocal, SlotOffset<Shape>::reciprocal);
+  // TEMPLATE order is Out, Src, Exp, Max, Scaling; ARGUMENT order is dst, exp,
+  // max, scaling, src.
+  TQuant_MXFP4_E2M1_Impl<QuantScaleAlg::OCP, decltype(nibbles),
+                         decltype(source), decltype(scales),
+                         decltype(block_max), decltype(reciprocal)>(
+      nibbles.data(), scales.data(), block_max.data(), reciprocal.data(),
+      source.data(), 1u, Shape::tile_elems);
+}
+#endif  // MXFP4_TQUANT
+
 // Move one tile of `T` between GM and UB. Partial carries only `valid`
 // elements: the load zero-fills the rest of the UB tile so the compute passes
 // still see whole registers, and the store truncates so padding never reaches
@@ -397,6 +453,11 @@ __global__ AICORE void mxfp4_quant(__gm__ void *input_gm,
                                      input_gm);
     wait_flag(PIPE_MTE2, PIPE_V, buffer_free[buffer]);
     const uint32_t slot_base = buffer * Shape::slot_stride;
+#ifdef MXFP4_TQUANT
+    tquant_passes<Shape>(slot_base + Offsets::input,
+                         slot_base + Offsets::nibbles,
+                         slot_base + Offsets::scales);
+#else
     // name the UB regions once; inline casts are noise at every call site
     using B16 = __ubuf__ uint16_t *;
     B16 input_ub = (B16)(uintptr_t)(slot_base + Offsets::input);
@@ -410,6 +471,7 @@ __global__ AICORE void mxfp4_quant(__gm__ void *input_gm,
     compact_maxima<Shape>(maxima_ub, packed_ub);
     derive_scales<Shape>(packed_ub, recips_ub, scale_ub);
     pack_nibbles<Shape>(input_ub, recips_ub, nibble_ub);
+#endif
     set_flag(PIPE_V, PIPE_MTE3, buffer_free[buffer]);
     wait_flag(PIPE_V, PIPE_MTE3, buffer_free[buffer]);
     if (tile_index == full_tiles) {
