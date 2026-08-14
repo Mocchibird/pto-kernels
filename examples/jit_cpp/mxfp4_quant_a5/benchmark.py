@@ -286,6 +286,32 @@ def gate(name, ours_out, other_out):
     return packed, scale, wrote
 
 
+COPY_BYTES_PER_ELEM = 4.0  # bf16 read + bf16 written
+
+
+def copy_contender(pool):
+    """A torch device-to-device copy, as the DMA floor for this shape.
+
+    fast_hadamard_a5 judges its transform against exactly this: for a
+    memory-bound op the honest yardstick is not a rival kernel but a plain copy
+    of the same bytes. It moves 4 B/element against the quantizer's 2.53, so the
+    two are compared as achieved bandwidth, each counting the bytes it moves.
+
+    It reads the SAME rotating pool as the other arms and writes to a rotating
+    destination. Copying one fixed buffer instead measured 5306 GB/s at K=256 --
+    above the HBM ceiling, because both buffers fit in the 128 MB L2.
+    """
+    dsts = [torch.empty_like(pool[0]) for _ in pool]
+    state = {"i": 0}
+
+    def run(x):
+        dst = dsts[state["i"] % len(dsts)]
+        state["i"] += 1
+        return dst.copy_(x)
+
+    return ("d2d_copy", run)
+
+
 def measure_pair(k, batch, which):
     """One matched pair, both arms on an identical call path.
 
@@ -310,6 +336,7 @@ def measure_pair(k, batch, which):
         contenders = [
             ("ours_raw", lambda x: mine(x, qa, sa)),
             ("tquant", lambda x: theirs(x, qb, sb)),
+            copy_contender(pool),
         ]
         mine(pool[0], qa, sa)
         theirs(pool[0], qb, sb)
@@ -332,9 +359,12 @@ def measure_pair(k, batch, which):
     first, second = contenders[0][0], contenders[1][0]
     ratio, low, high, resolved = paired_speedup(samples[first], samples[second])
     rows = []
-    for name in (first, second):
+    for name, _ in contenders:
         taken = samples[name]
         micros = statistics.median(taken)
+        # the copy moves 4 B/element where the quantizer moves 2.53, so each
+        # counts the bytes it actually moves and the two meet as bandwidth
+        per_elem = COPY_BYTES_PER_ELEM if name == "d2d_copy" else BYTES_PER_ELEM
         rows.append(
             {
                 "pair": which,
@@ -345,9 +375,9 @@ def measure_pair(k, batch, which):
                 "p_lo": round(min(taken), 3),
                 "p_hi": round(max(taken), 3),
                 "spread_pct": round(100 * (max(taken) - min(taken)) / micros, 1),
-                "gbs": round(batch * k * BYTES_PER_ELEM / (micros * 1e-6) / 1e9, 1),
-                "packed_match": round(match[0], 6),
-                "scale_match": round(match[1], 6),
+                "gbs": round(batch * k * per_elem / (micros * 1e-6) / 1e9, 1),
+                "packed_match": round(match[0], 6) if name != "d2d_copy" else 1.0,
+                "scale_match": round(match[1], 6) if name != "d2d_copy" else 1.0,
                 "speedup": round(ratio, 4) if name == second else 1.0,
                 "speedup_lo": round(low, 4) if name == second else 1.0,
                 "speedup_hi": round(high, 4) if name == second else 1.0,
