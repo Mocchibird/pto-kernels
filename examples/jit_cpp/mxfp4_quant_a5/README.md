@@ -26,7 +26,7 @@ MXFP4 block quantization for Ascend 950 / A5 (`dav-c310`), JIT-compiled with `bi
 
 ## Correctness
 
-`pytest` → **88 passed** on real A5. Scale bytes and E2M1 nibbles identical to `torch_npu`. Covers every supported `K`, batches 1/7/33/64/128/1000/4097/12345/65536, eight adversarial block families, the partial-tile tail, the host padding path, the active-stream invariant, and rejection of unsupported `K`, wrong dtype and non-contiguous input. CI builds and lints but cannot run these — the gate needs the hardware.
+`pytest` → **88 passed** on real A5, on **two different parts and two different toolkits**: an Ascend 950DT on CANN 9.0.0 / 9.1.0-beta.3, and an Ascend 950PR (`Ascend950PR_9589`) on CANN 9.1.0 release. Scale bytes and E2M1 nibbles identical to `torch_npu`. Covers every supported `K`, batches 1/7/33/64/128/1000/4097/12345/65536, eight adversarial block families, the partial-tile tail, the host padding path, the active-stream invariant, and rejection of unsupported `K`, wrong dtype and non-contiguous input. CI builds and lints but cannot run these — the gate needs the hardware.
 
 Quality on `N(0,1)`, K=4096: relative RMSE **0.115**, R² **0.987**.
 
@@ -154,6 +154,12 @@ arm needs no extra file:
 # vendor arm is stable there -- it is not
 ./run_benchmark.sh --axis k --pairs api --ks 64,128,256,512 --tag m01
 ```
+
+PTO 9.1.0 shipped two different `TQuant_MXFP4_E2M1_Impl` signatures -- the release
+headers added a `bool Exp2DStrided` template parameter that 9.1.0-beta.3 does not
+have -- so `benchmark.py` compiles the variant both ways and keeps whichever the
+local headers accept. Both were exercised: the numbers below come from beta.3, and
+the release form was verified separately on an Ascend 950PR.
 
 Repeat with `--tag 2`, `--tag 3`, ... one process each; every figure here is a
 median over 3 processes (5 for the peak probe). Each arm is gated for
