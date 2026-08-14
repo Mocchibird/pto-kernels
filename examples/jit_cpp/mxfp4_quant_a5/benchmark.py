@@ -137,14 +137,25 @@ def build_tquant(k):
         f"-mllvm -cce-aicore-dcci-insert-for-scalar=false -Xhost-start -Xhost-end "
         f"-I{home}/aarch64-linux/include -I{home}/include"
     ).split()
-    compile_step = subprocess.run(
-        [f"{home}/bin/bisheng", *flags, "-c", str(source), "-o", str(obj)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if compile_step.returncode != 0:
-        raise TQuantUnavailable(compile_step.stderr.strip()[-400:])
+    # PTO 9.1.0 release inserted a `bool Exp2DStrided` template parameter that
+    # 9.1.0-beta.3 lacks, and the tile types sit in a non-deduced position, so one
+    # spelling cannot serve both. Try the beta.3 form, then the release form.
+    errors = []
+    for extra in ([], ["-DMXFP4_TQUANT_EXP2D"]):
+        compile_step = subprocess.run(
+            [f"{home}/bin/bisheng", *flags, *extra, "-c", str(source), "-o", str(obj)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if compile_step.returncode == 0:
+            break
+        errors.append(
+            f"{' '.join(extra) or 'no extra flag'}: "
+            f"{compile_step.stderr.strip()[-300:]}"
+        )
+    else:
+        raise TQuantUnavailable("\n".join(errors))
     subprocess.run(
         [
             f"{home}/bin/bisheng",

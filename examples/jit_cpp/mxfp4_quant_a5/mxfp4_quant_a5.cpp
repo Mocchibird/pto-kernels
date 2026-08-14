@@ -364,12 +364,23 @@ inline AICORE void tquant_passes(uint32_t input_offset, uint32_t nibble_offset,
   TASSIGN(block_max, SlotOffset<Shape>::maxima);
   TASSIGN(reciprocal, SlotOffset<Shape>::reciprocal);
   // TEMPLATE order is Out, Src, Exp, Max, Scaling; ARGUMENT order is dst, exp,
-  // max, scaling, src.
+  // max, scaling, src. PTO 9.1.0 release inserted a `bool Exp2DStrided` second
+  // template parameter that 9.1.0-beta.3 does not have; the tile types are in a
+  // non-deduced position, so neither spelling can be dropped. benchmark.py
+  // compiles both and keeps whichever the local headers accept.
+#ifdef MXFP4_TQUANT_EXP2D
+  TQuant_MXFP4_E2M1_Impl<QuantScaleAlg::OCP, false, decltype(nibbles),
+                         decltype(source), decltype(scales),
+                         decltype(block_max), decltype(reciprocal)>(
+      nibbles.data(), scales.data(), block_max.data(), reciprocal.data(),
+      source.data(), 1u, Shape::tile_elems);
+#else
   TQuant_MXFP4_E2M1_Impl<QuantScaleAlg::OCP, decltype(nibbles),
                          decltype(source), decltype(scales),
                          decltype(block_max), decltype(reciprocal)>(
       nibbles.data(), scales.data(), block_max.data(), reciprocal.data(),
       source.data(), 1u, Shape::tile_elems);
+#endif
 }
 #endif  // MXFP4_TQUANT
 
