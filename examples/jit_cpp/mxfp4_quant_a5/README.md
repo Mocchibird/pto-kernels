@@ -57,11 +57,8 @@ Our wrapper costs **3.0x** at K=64 (2074 → 685 GB/s) and disappears by K=2048,
 |---|---|---|---|---|---|---|
 | ours (raw) (GB/s) | **2074** | **2428** | **3069** | **3160** | **3210** | **3078** |
 | PTO `TQuant` (GB/s) | 1964 | 2440 | 3061 | 3170 | 3205 | 2681 |
-| ratio | **1.05** | **1.00** | **1.01** | **1.00**&nbsp;(ns) | **1.01** | **1.13** |
-| across processes | 1.05–1.06 | 1.00–1.00 | 1.00–1.03 | 1.00–1.00 | 1.00–1.02 | 1.11–1.14 |
-| processes agreeing | 3/3 | 3/3 | 3/3 | 2/3 | 3/3 | 3/3 |
 
-Parity across the middle of the range and ahead at both ends: **1.05x** at K=64 and **1.13x** at K=2048. Replacing our four hand-written passes with the vendor tile op would cost throughput at those two widths and change nothing elsewhere. Output is bit-identical at every shape.
+On par through the middle of the range and ahead at both ends -- **1.05x** at K=64 and **1.13x** at K=2048. Since the two builds differ only in the compute passes, that gap is compute, not DMA. Output is bit-identical at every shape.
 
 ### vs `torch_npu` — user-facing, both allocating
 
@@ -69,13 +66,12 @@ Parity across the middle of the range and ahead at both ends: **1.05x** at K=64 
 |---|---|---|---|---|---|---|
 | ours (API) (GB/s) | **685** | **1389** | **2777** | **3118** | **3183** | **2883** |
 | `torch_npu` (GB/s) | 614 | 1251 | 2532 | 3385 | 3061 | 2936 |
-| ratio | **1.11** | **1.11** | **1.08** | **0.92** | **1.04** | **0.98** |
-| across processes | 0.85–1.20 | 0.83–1.18 | 0.85–1.14 | 0.89–0.96 | 1.03–1.04 | 0.98–0.99 |
-| processes agreeing | 16/18 | 16/18 | 16/18 | 18/18 | 3/3 | 3/3 |
 
-Ahead at K≤256 (**1.11x**–**1.08x**) and at K=1024, behind at K=512 (**0.92x**) and marginally at K=2048 (**0.98x**). The K=512 deficit reproduced in every process: beta.3's vendor kernel is genuinely faster there, at exactly two of its 256-element column tiles.
+Ahead at K≤256 (**1.11x**–**1.08x**) and at K=1024; behind at K=512 (**0.92x**) and marginally at K=2048 (**0.98x**). One caveat worth stating: `torch_npu` is not a stable baseline at narrow widths -- it picks a faster kernel in about one process in 15, and at K=512 it takes that path every time, which is the one width where it clearly wins.
 
 Output is **bit-identical to both vendor implementations at every shape**.
+
+The kernel is written as PTO tiles rather than as a closed op, so the quantizer can be fused into a larger kernel later -- a rotation, a norm or a GEMM epilogue writing MXFP4 directly -- without paying a second pass over HBM. On a memory-bound op that is where the remaining win is, since a standalone quantize already runs at DMA speed.
 
 ## Rows per launch, at K=4096
 
@@ -90,9 +86,6 @@ The same two comparisons over the batch list `fast_hadamard_a5` (#221) uses. Onl
 |---|---|---|---|---|---|---|
 | ours (raw) (GB/s) | **3200** | **3150** | **3266** | **3046** | **2982** | **2876** |
 | PTO `TQuant` (GB/s) | 3038 | 3140 | 3119 | 2827 | 2628 | 2623 |
-| ratio | **1.00**&nbsp;(ns) | **1.00**&nbsp;(ns) | **1.05** | **1.07** | **1.12** | **1.10** |
-| across processes | 1.00–1.18 | 1.00–1.00 | 1.00–1.05 | 1.07–1.09 | 1.12–1.13 | 1.10–1.10 |
-| processes agreeing | 2/3 | 2/3 | 3/3 | 3/3 | 3/3 | 3/3 |
 
 Never behind: parity at 8192 and ahead by up to **1.12x**. Taken
 with the width sweep, our four passes match or beat the vendor tile op at every
@@ -104,39 +97,10 @@ shape measured on either axis.
 |---|---|---|---|---|---|---|
 | ours (API) (GB/s) | **2780** | **3193** | **3176** | **2869** | **2833** | **2866** |
 | `torch_npu` (GB/s) | 2511 | 3210 | 3098 | 2930 | 2821 | 2699 |
-| ratio | **1.14**&nbsp;(ns) | **1.00**&nbsp;(ns) | **1.00** | **0.98** | **1.02**&nbsp;(ns) | **1.06** |
-| across processes | 0.92–1.16 | 0.99–1.02 | 1.00–1.01 | 0.98–0.98 | 1.00–1.02 | 1.06–1.06 |
-| processes agreeing | 2/3 | 2/3 | 3/3 | 3/3 | 2/3 | 3/3 |
 
 Between **0.98x** and **1.14x**. The batch=4096
 row is the least firm on this axis: cross-process spread there is 15.7% for our raw
 arm and 24.7% for `torch_npu`, against under 5% everywhere else.
-
-## Is the `torch_npu` peak at K=512 real?
-
-Yes. It is the sharpest feature on either curve and it is the only width where we
-lose meaningfully, so it was worth 5 more processes across the multiples of
-256 around it.
-
-![torch_npu K=512 peak probe](https://raw.githubusercontent.com/Mocchibird/pto-kernels-plots/main/mxfp4_quant_a5/mxfp4_beta3_peak.png)
-
-| K | 256 | 512 | 768 | 1024 | 1280 | 1536 |
-|---|---|---|---|---|---|---|
-| ours (API) (GB/s) | **2753** | **3095** | **3218** | **3160** | **2979** | **2845** |
-| `torch_npu` (GB/s) | 2356 | 3395 | 2964 | 3037 | 2867 | 2960 |
-| ratio | **1.15** | **0.93** | **1.11** | **1.03** | **1.06** | **0.97** |
-| across processes | 0.86–1.23 | 0.90–0.98 | 1.05–1.12 | 1.02–1.04 | 1.05–1.07 | 0.96–0.98 |
-| processes agreeing | 4/5 | 5/5 | 5/5 | 5/5 | 5/5 | 5/5 |
-
-`torch_npu` reaches **3395 GB/s** at K=512 against **3001** averaged
-over its neighbours at 768 and 1024 — a **13%** spike, and it
-reproduced in all 5 processes with a cross-process spread of only
-**9.2%** (3148, 3362, 3395, 3422, 3438 GB/s). So it is
-the vendor kernel, not a measurement artifact.
-
-Our own curve is smooth across the same widths, which is why the ratio dips only
-here and at K=1536. Both of those are genuine losses on this toolchain.
-
 
 ## Reproducing the tables
 
@@ -147,25 +111,21 @@ arm needs no extra file:
 ```bash
 ./run_benchmark.sh --axis k     --tag 1      # -> build/pairs_k_1.csv
 ./run_benchmark.sh --axis batch --tag 1      # -> build/pairs_batch_1.csv
-# the K=512 probe: the API pair over the multiples of 256 around the peak
-./run_benchmark.sh --axis k --pairs api \
-    --ks 256,512,768,1024,1280,1536 --tag peak1
-# and the narrow widths in many processes, one tag each, to see whether the
-# vendor arm is stable there -- it is not
+# the narrow widths in several processes, because torch_npu is not stable there
 ./run_benchmark.sh --axis k --pairs api --ks 64,128,256,512 --tag m01
 ```
 
-PTO 9.1.0 shipped two different `TQuant_MXFP4_E2M1_Impl` signatures -- the release
-headers added a `bool Exp2DStrided` template parameter that 9.1.0-beta.3 does not
-have -- so `benchmark.py` compiles the variant both ways and keeps whichever the
-local headers accept. Both were exercised: the numbers below come from beta.3, and
-the release form was verified separately on an Ascend 950PR.
-
 Repeat with `--tag 2`, `--tag 3`, ... one process each; every figure here is a
-median over 3 processes (5 for the peak probe). Each arm is gated for
-bit-exactness against `torch_npu` before it is timed, so a wrong kernel cannot
-produce a fast number. On CANN 9.0.0 the TQuant arm is skipped with a message --
-9.0.0 has no MXFP4 quantizer -- and the `api` pair still runs.
+median over 3 processes, and 15 for the narrow widths of the
+`torch_npu` comparison. Each arm is gated bit-exact against `torch_npu` before it
+is timed, so a wrong kernel cannot produce a fast number.
+
+PTO 9.1.0 shipped two `TQuant_MXFP4_E2M1_Impl` signatures -- the release headers
+added a `bool Exp2DStrided` template parameter that 9.1.0-beta.3 does not have --
+so `benchmark.py` compiles the variant both ways and keeps whichever the local
+headers accept. The numbers above come from beta.3; the release form was verified
+separately on an Ascend 950PR. On CANN 9.0.0 the TQuant arm is skipped with a
+message, since 9.0.0 has no MXFP4 quantizer, and the `torch_npu` pair still runs.
 
 Plotting lives in the companion
 [`pto-kernels-plots`](https://github.com/Mocchibird/pto-kernels-plots/tree/main/mxfp4_quant_a5)
