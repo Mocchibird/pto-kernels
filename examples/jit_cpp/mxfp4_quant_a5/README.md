@@ -43,11 +43,11 @@ Each contender is timed in 64 brackets, interleaved one bracket at a time with a
 | ours (GB/s) | **685** | **1389** | **2777** | **3118** | **3183** | **2883** |
 | `torch_npu` (GB/s) | 614 | 1251 | 2532 | 3385 | 3061 | 2936 |
 
-Ahead at K≤256 (**1.08x**–**1.11x**) and at K=1024; behind at K=512 (**0.92x**) and marginally at K=2048 (**0.98x**). Both arms are one Python call that allocates its own outputs -- `torch_npu` has no preallocated entry point, and pairing a bare launch against an allocating call is what invented a 1.67x in an earlier version of this benchmark.
+Ahead at K≤256 (**1.10x**–**1.12x**) and at K=1024; behind at K=512 (**0.92x**) and marginally at K=2048 (**0.98x**). Both arms are one Python call that allocates its own outputs -- `torch_npu` has no preallocated entry point, and pairing a bare launch against an allocating call is what invented a 1.67x in an earlier version of this benchmark.
 
 One caveat: `torch_npu` is not a stable baseline at narrow widths. It picks a faster kernel in about one process in 15, and at K=512 it takes that path every time, which is the one width where it clearly wins.
 
-> **Against PTO's own quantizer.** `benchmark.py` also builds this source a second time with `-DMXFP4_TQUANT`, swapping our four compute passes for PTO 9.1.0's `TQuant_MXFP4_E2M1` tile op and leaving tiling, buffering and every `TLOAD`/`TSTORE` identical. On that matched raw launch ours is **on par or a little ahead at every width** -- 1.05x at K=64, ~1.00x through the middle, 1.13x at K=2048 -- with bit-identical output. The full data is in the CSVs.
+> **Against PTO's own quantizer.** `benchmark.py` also builds this source a second time with `-DMXFP4_TQUANT`, swapping our four compute passes for PTO 9.1.0's `TQuant_MXFP4_E2M1` tile op and leaving tiling, buffering and every `TLOAD`/`TSTORE` identical. On that matched raw launch ours is **on par or a little ahead at every width** -- 1.06x at K=64, ~1.00x through the middle, 1.15x at K=2048 -- with bit-identical output. The full data is in the CSVs.
 
 
 ## Rows per launch, at K=4096
@@ -62,7 +62,7 @@ and 8192 of those values are legal widths here, so this is the batch axis.
 | ours (GB/s) | **2780** | **3193** | **3176** | **2869** | **2833** | **2866** |
 | `torch_npu` (GB/s) | 2511 | 3210 | 3098 | 2930 | 2821 | 2699 |
 
-Between **0.98x** and **1.14x**. Against `TQuant` on the same axis ours runs 1.00x-1.12x.
+Between **0.98x** and **1.11x**. Against `TQuant` on the same axis ours runs 1.00x-1.13x.
 
 ## Reproducing the tables
 
