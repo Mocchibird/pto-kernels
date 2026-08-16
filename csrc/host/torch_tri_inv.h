@@ -11,9 +11,19 @@ for the full License text.
 #include <ATen/ATen.h>
 #include <torch/library.h>
 
-#include "aclrtlaunch_triv_inv_col_sweep_fp16.h"
-#include "aclrtlaunch_triv_inv_col_sweep_fp32.h"
 #include "utils.h"
+
+extern "C" {
+
+void pto_launch_triv_inv_col_sweep_fp16(uint32_t blockDim, void* stream,
+                                        void* x, void* z, uint32_t in_length,
+                                        uint32_t matrix_size);
+
+void pto_launch_triv_inv_col_sweep_fp32(uint32_t blockDim, void* stream,
+                                        void* x, void* z, uint32_t in_length,
+                                        uint32_t matrix_size);
+
+}  // extern "C"
 
 namespace pto_isa_ops {
 
@@ -28,14 +38,15 @@ namespace pto_isa_ops {
 at::Tensor run_tri_inv(const at::Tensor& x) {
   const at::Device device = x.options().device();
   const auto dtype = x.options().dtype();
-  if (x.dim() < 2) {
-    throw std::runtime_error("Input tensor must have at least 2 dimensions.\n");
-  }
+  TORCH_CHECK(device.type() == DEVICE_TYPE,
+              "tri_inv: tensor must be on NPU, got ", device);
+  TORCH_CHECK(x.dim() >= 2,
+              "tri_inv: input tensor must have at least 2 dimensions, got ",
+              x.dim());
 
   const uint32_t matrix_size = static_cast<uint32_t>(x.size(-1));
-  if (matrix_size != x.size(-2)) {
-    throw std::runtime_error("Only square matrices are supported.\n");
-  }
+  TORCH_CHECK(matrix_size == static_cast<uint32_t>(x.size(-2)),
+              "tri_inv: only square matrices are supported");
 
   const uint32_t num_elems = static_cast<uint32_t>(x.numel());
   const uint32_t total_tiles =
@@ -48,16 +59,14 @@ at::Tensor run_tri_inv(const at::Tensor& x) {
 
   const at::Tensor z = at::empty_like(x);
 
+  TORCH_CHECK(dtype == at::kHalf || dtype == at::kFloat,
+              "tri_inv: dtype must be fp16 or float32, got ", dtype);
   if (dtype == at::kHalf) {
     EXEC_KERNEL_CMD(triv_inv_col_sweep_fp16, block_dim, x, z, num_elems,
                     matrix_size);
-
-  } else if (dtype == at::kFloat) {
+  } else {
     EXEC_KERNEL_CMD(triv_inv_col_sweep_fp32, block_dim, x, z, num_elems,
                     matrix_size);
-
-  } else {
-    throw std::runtime_error("Unsupported dtype for `tri_inv` kernel");
   }
 
   return z;

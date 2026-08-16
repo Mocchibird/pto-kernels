@@ -11,9 +11,17 @@ for the full License text.
 #include <ATen/ATen.h>
 #include <torch/library.h>
 
-#include "aclrtlaunch_vabs_fp16.h"
-#include "aclrtlaunch_vabs_fp32.h"
 #include "utils.h"
+
+extern "C" {
+
+void pto_launch_vabs_fp16(uint32_t blockDim, void* stream, void* x, void* z,
+                          uint32_t in_length);
+
+void pto_launch_vabs_fp32(uint32_t blockDim, void* stream, void* x, void* z,
+                          uint32_t in_length);
+
+}  // extern "C"
 
 namespace pto_isa_ops {
 
@@ -40,14 +48,14 @@ at::Tensor run_abs(const at::Tensor& x) {
     block_dim = total_tiles;
   }
 
+  TORCH_CHECK(x.device().type() == DEVICE_TYPE,
+              "pto_abs: tensor must be on NPU, got ", x.device());
+  TORCH_CHECK(dtype == at::kHalf || dtype == at::kFloat,
+              "pto_abs: dtype must be fp16 or float32, got ", dtype);
   if (dtype == at::kHalf) {
     EXEC_KERNEL_CMD(vabs_fp16, block_dim, x, z, total_size);
-
-  } else if (dtype == at::kFloat) {
-    EXEC_KERNEL_CMD(vabs_fp32, block_dim, x, z, total_size);
-
   } else {
-    throw std::runtime_error("Unsupported dtype for `pto_abs` kernel");
+    EXEC_KERNEL_CMD(vabs_fp32, block_dim, x, z, total_size);
   }
 
   return z;

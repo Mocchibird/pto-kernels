@@ -5,27 +5,62 @@
 # https://github.com/huawei-csl/pto-kernels/
 # for the full License text.
 # --------------------------------------------------------------------------------
-.PHONY: clean setup_once build_wheel install test
+PTO_LIB_PATH    ?= $(ASCEND_TOOLKIT_HOME)
+CSRC_KERNEL_DIR := csrc/kernel
+
+.PHONY: clean setup_once build wheel install docs test test_tri_inv
 
 clean:
-	rm -rf build/ dist/ extra-info/ *.egg-info/ kernel_meta/
+	rm -rf build/ dist/ extra-info/ *.egg-info/ kernel_meta/ pto_kernels-*.whl
 
 setup_once:
 	pip3 install -r requirements.txt
-	pip3 install torch-npu==2.8.0.post2 --extra-index-url https://download.pytorch.org/whl/cpu
 
-build_cmake: clean
+build: clean
 	bash scripts/build.sh
 
-build_wheel:
-	export CMAKE_GENERATOR="Unix Makefiles" && pip wheel -v  . --extra-index-url https://download.pytorch.org/whl/cpu
+wheel: clean
+	export CMAKE_GENERATOR="Unix Makefiles" && pip wheel -v . --extra-index-url https://download.pytorch.org/whl/cpu
+
+
+# 'make compile_abs' compiles 'kernel_abs.cpp' into 'build/lib/libkernel_abs.so' without building the whole wheel package.
+# This is useful for development and debugging of individual kernels.
+compile_%:
+	mkdir -p build/lib/
+	bisheng -fPIC -shared -xcce -DMEMORY_BASE -O2 -std=c++17 \
+		-I$(CSRC_KERNEL_DIR) \
+		-I$(PTO_LIB_PATH)/include \
+	        -I${ASCEND_TOOLKIT_HOME}/pkg_inc \
+		-I${ASCEND_TOOLKIT_HOME}/pkg_inc/runtime \
+		-I${ASCEND_TOOLKIT_HOME}/pkg_inc/profiling \
+		--npu-arch=dav-2201 \
+		-Wno-ignored-attributes \
+		$(CSRC_KERNEL_DIR)/kernel_$*.cpp \
+		-o build/lib/libkernel_$*.so
+
+compile_a5_%:
+	mkdir -p build/lib/
+	bisheng -fPIC -shared -xcce -DREGISTER_BASE -O2 -std=gnu++17 \
+		-I$(CSRC_KERNEL_DIR) \
+		-I$(PTO_LIB_PATH)/include \
+	        -I${ASCEND_TOOLKIT_HOME}/pkg_inc \
+		-I${ASCEND_TOOLKIT_HOME}/pkg_inc/runtime \
+		-I${ASCEND_TOOLKIT_HOME}/pkg_inc/profiling \
+		--cce-aicore-arch=dav-c310 \
+		-mllvm -cce-aicore-stack-size=0x8000 \
+		-mllvm -cce-aicore-function-stack-size=0x8000 \
+		-Wno-ignored-attributes \
+		$(CSRC_KERNEL_DIR)/kernel_$*.cpp \
+		-o build/lib/libkernel_$*.so
 
 install:
 	python3 -m pip install --force-reinstall pto_kernels-*.whl
-
 
 docs:
 	doxygen doxygen/Doxyfile
 
 test:
 	pytest -v tests/
+
+test_tri_inv:
+	pytest tests/test_tri_inv_*.py

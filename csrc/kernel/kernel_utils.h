@@ -8,10 +8,7 @@ for the full License text.
 */
 #pragma once
 
-// FIXME(zouzias): Current development is based on A2/A3 architectures.
-#if !defined(MEMORY_BASE) && !defined(REGISTER_BASE)
-#define MEMORY_BASE
-#endif
+#include <cstddef>
 #include <pto/pto-inst.hpp>
 #include <type_traits>
 
@@ -51,6 +48,61 @@ template <typename T1, typename T2,
                                   int>::type = 0>
 AICORE inline T1 CeilDiv(T1 value, T2 divisor) {
   return (value + divisor - 1) / divisor;
+}
+
+/**
+ * @brief Square root usable in constant expressions.
+ *
+ * std::sqrt is not constexpr, so compile-time scales (e.g. 1/sqrt(head_size))
+ * are computed here with a fixed 8-step Babylonian (Newton-Raphson) iteration.
+ * That converges to fp32 precision for the tile-dimension-sized inputs this is
+ * used with. Not meant for runtime math: use the hardware sqrt for that.
+ *
+ * @param [in] x Value to take the square root of.
+ * @return sqrt(x), or 0 for non-positive @p x.
+ */
+constexpr AICORE inline float ConstexprSqrt(float x) {
+  if (x <= 0.0f) return 0.0f;
+  float guess = x;
+  for (int i = 0; i < 8; ++i) {
+    guess = 0.5f * (guess + x / guess);
+  }
+  return guess;
+}
+
+/**
+ * @brief Inverse square root usable in constant expressions.
+ *
+ * @param [in] x Value to take the inverse square root of. Must be positive.
+ * @return 1/sqrt(x).
+ */
+constexpr AICORE inline float ConstexprInvSqrt(float x) {
+  return 1.0f / ConstexprSqrt(x);
+}
+
+/**
+ * @brief Byte size of the storage backing a single tile.
+ *
+ * @tparam TileType Tile type to measure.
+ * @return Rows * Cols * sizeof(element type) in bytes.
+ */
+template <typename TileType>
+constexpr AICORE std::size_t TileStorageBytes() {
+  using ElementType = typename TileType::DType;
+  return static_cast<std::size_t>(TileType::Rows * TileType::Cols) *
+         sizeof(ElementType);
+}
+
+/**
+ * @brief Byte size of a ping-pong array of tiles.
+ *
+ * @tparam TileType   Tile type to measure.
+ * @tparam NumBuffers Number of buffers in the array.
+ * @return TileStorageBytes<TileType>() * NumBuffers.
+ */
+template <typename TileType, std::size_t NumBuffers>
+constexpr AICORE std::size_t TileBufferTotalBytes() {
+  return TileStorageBytes<TileType>() * NumBuffers;
 }
 
 #define BSND_OFFSET(tile_id, N, S, D) \
@@ -102,6 +154,105 @@ AICORE inline BSNDVarlenTileInfo GetBSNDVarlenTileInfoFromCuSeqlens(
     accumulated_chunks += seq_num_chunks;
     seq_start = seq_end;
   }
+}
+
+// ─── SyncAll: full cross-core barrier ────────────────────────
+constexpr uint16_t SYNC_AIV_FLAG = 12;
+constexpr uint16_t SYNC_AIC_FLAG = 11;
+constexpr uint16_t SYNC_AIC_AIV_FLAG = 13;
+constexpr uint16_t SYNC_AIV_ONLY_ALL = 14;
+constexpr uint16_t SYNC_MODE_SHIFT_VALUE = 4;
+constexpr uint16_t SYNC_FLAG_SHIFT_VALUE = 8;
+
+/**
+ * @brief Gets the FFTS message for cross-core synchronization.
+ *
+ * @param mode The synchronization mode.
+ * @param flagId The event id to sync for.
+ * @return The FFTS message.
+ */
+AICORE inline uint16_t GetffstMsg(uint16_t mode, uint16_t flagId) {
+  return (0x1 + ((mode & 0x3) << SYNC_MODE_SHIFT_VALUE) +
+          ((flagId & 0xf) << SYNC_FLAG_SHIFT_VALUE));
+}
+
+/**
+ * @brief Synchronizes all cores.
+ *
+ * @tparam isAIVOnly Whether to synchronize only AIV cores.
+ */
+template <bool isAIVOnly = true>
+AICORE inline void SyncAll() {
+  pipe_barrier(PIPE_ALL);
+  if constexpr (isAIVOnly) {
+    ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x0, SYNC_AIV_ONLY_ALL));
+    wait_flag_dev(SYNC_AIV_ONLY_ALL);
+    return;
+  }
+#if defined(__DAV_CUBE__)
+  wait_flag_dev(SYNC_AIV_FLAG);
+  ffts_cross_core_sync(PIPE_FIX, GetffstMsg(0x0, SYNC_AIC_FLAG));
+  wait_flag_dev(SYNC_AIC_FLAG);
+  ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x02, SYNC_AIC_AIV_FLAG));
+#elif defined(__DAV_VEC__)
+  ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x02, SYNC_AIV_FLAG));
+  wait_flag_dev(SYNC_AIC_AIV_FLAG);
+#endif
+}
+
+/**
+ * @brief Returns the outer matrix layout based on the target architecture and
+ * matrix orientation.
+ *
+ * On DAV C310 targets, the layout depends on whether the matrix is "left-sided"
+ * (L0A). DAV C310: L0A is NZ, L0B is ZN. Older: L0A is ZZ, L0B is ZN.
+ *
+ * Link:
+ * https://pto-isa.github.io/docs/isa/cube/nz-fractal-layout/#per-buffer-nz-layouts
+ *
+ * @param is_left Whether the matrix is on the left side (L0A) or not (L0B).
+ * @return The appropriate @c BLayout for the target architecture.
+ */
+constexpr inline pto::BLayout GetOuterLayout(bool is_left) {
+#ifdef __DAV_C310__
+  return is_left ? pto::BLayout::ColMajor : pto::BLayout::RowMajor;
+#else
+  return pto::BLayout::RowMajor;
+#endif
+}
+
+/**
+ * @brief Pipe in-core barrier for vector core.
+ *
+ */
+AICORE inline void PipeBarrierVec() {
+#if __CCE_AICORE__ == 220
+  pipe_barrier(PIPE_V);
+#endif
+}
+
+template <pipe_t Pipe>
+AICORE inline void SetCrossFlag(int32_t flag) {
+  constexpr int32_t VEC_NUM = 2;
+  ffts_cross_core_sync(Pipe, 1 | (VEC_NUM << 4) | (flag << 8));
+}
+
+template <pipe_t Pipe>
+AICORE inline void SignalBothVecOnA5(uint16_t flag) {
+  // A5: the flag offset is 16 on new core.
+  constexpr uint16_t VEC_FLAG_OFFSET = 16;
+
+  set_intra_block(Pipe, flag);
+  set_intra_block(Pipe, flag + VEC_FLAG_OFFSET);
+}
+
+template <pipe_t Pipe>
+AICORE inline void WaitBothVecOnA5(uint16_t flag) {
+  // A5: the flag offset is 16 on new core.
+  constexpr uint16_t VEC_FLAG_OFFSET = 16;
+
+  wait_intra_block(Pipe, flag);
+  wait_intra_block(Pipe, flag + VEC_FLAG_OFFSET);
 }
 
 }  // namespace kernel_utils

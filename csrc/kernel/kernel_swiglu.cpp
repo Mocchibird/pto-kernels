@@ -10,6 +10,7 @@ for the full License text.
 #include "kernel_utils.h"
 
 using namespace pto;
+using namespace kernel_utils;
 
 #define DIV_ROUNDUP(x, y) (((x) + (y) - 1) / (y))
 #define ALIGN_UP(x, y) (DIV_ROUNDUP((x), (y)) * (y))
@@ -59,7 +60,7 @@ static_assert(UB_SLOT_BYTES * 6 == UB_USABLE_BYTES,
 static_assert(Y_PONG + Y_BUFFER_BYTES <= UB_USABLE_BYTES,
               "SwiGLU UB layout exceeds usable UB.");
 
-#if __CCE_AICORE__ == 220 && defined(__DAV_C220_VEC__)
+#if defined(__DAV_VEC__)
 
 namespace {
 
@@ -184,15 +185,15 @@ template <typename TileData, typename T>
 AICORE inline void computeSwiGLUTile(TileData& x0Tile, TileData& x1Tile,
                                      TileData& yTile) {
   TMULS(yTile, x0Tile, (T)-1);
-  pipe_barrier(PIPE_V);
+  PipeBarrierVec();
   TEXP(yTile, yTile);
-  pipe_barrier(PIPE_V);
+  PipeBarrierVec();
   TADDS(yTile, yTile, (T)1);
-  pipe_barrier(PIPE_V);
+  PipeBarrierVec();
   TDIV(yTile, x0Tile, yTile);
-  pipe_barrier(PIPE_V);
+  PipeBarrierVec();
   TMUL(yTile, yTile, x1Tile);
-  pipe_barrier(PIPE_V);
+  PipeBarrierVec();
 }
 
 // col_count is padded for UB tile sizing; col_count_store is the actual GM
@@ -202,7 +203,7 @@ AICORE void issueTLoad(__gm__ T* x, uint32_t input_n, uint32_t output_n,
                        const TileWork& tile, unsigned x0_base, unsigned x1_base,
                        event_t ev) {
   using TileShapeND = TileShape2D<T, DYNAMIC, DYNAMIC, Layout::ND>;
-  using DynStrideND = Stride<1, 1, 1, DYNAMIC, 1>;
+  using DynStrideND = pto::Stride<1, 1, 1, DYNAMIC, 1>;
   using GlobalData = GlobalTensor<T, TileShapeND, DynStrideND, Layout::ND>;
   using TileData = Tile<TileType::Vec, T, kTileRows, kTileCols,
                         BLayout::RowMajor, DYNAMIC, DYNAMIC>;
@@ -232,7 +233,7 @@ template <typename T, uint32_t kTileRows, uint32_t kTileCols>
 AICORE void issueTStore(__gm__ T* y, uint32_t output_n, const TileWork& tile,
                         unsigned y_base, event_t ev) {
   using TileShapeND = TileShape2D<T, DYNAMIC, DYNAMIC, Layout::ND>;
-  using DynStrideND = Stride<1, 1, 1, DYNAMIC, 1>;
+  using DynStrideND = pto::Stride<1, 1, 1, DYNAMIC, 1>;
   using GlobalData = GlobalTensor<T, TileShapeND, DynStrideND, Layout::ND>;
   using TileData = Tile<TileType::Vec, T, kTileRows, kTileCols,
                         BLayout::RowMajor, DYNAMIC, DYNAMIC>;
@@ -256,7 +257,7 @@ template <uint32_t kTileCols, typename T>
 AICORE void runTSwiGLUTiled(__gm__ T* x, __gm__ T* y, uint32_t batch,
                             uint32_t input_n, uint32_t num_cores, uint32_t vid,
                             uint32_t row_tile_len) {
-#if __CCE_AICORE__ == 220 && defined(__DAV_C220_VEC__)
+#if defined(__DAV_VEC__)
   constexpr uint32_t kTileRows = ELEMENTS_PER_TILE / kTileCols;
   static_assert(kTileRows * kTileCols == ELEMENTS_PER_TILE,
                 "2D tile shape must match the UB vector tile capacity.");
@@ -338,7 +339,7 @@ template <typename T>
 AICORE void runTSwiGLUMainTiled(__gm__ T* x, __gm__ T* y, uint32_t batch,
                                 uint32_t input_n, uint32_t num_cores,
                                 uint32_t vid) {
-#if __CCE_AICORE__ == 220 && defined(__DAV_C220_VEC__)
+#if defined(__DAV_VEC__)
   const uint32_t output_n = input_n >> 1;
   const TileConfig cfg = chooseTileConfig(batch, output_n, num_cores);
 
@@ -368,7 +369,7 @@ AICORE void runTSwiGLUMainTiled(__gm__ T* x, __gm__ T* y, uint32_t batch,
 template <typename T>
 AICORE void runTSwiGLU(__gm__ T* x, __gm__ T* y, uint32_t batch,
                        uint32_t input_n, uint32_t num_cores, uint32_t vid) {
-#if __CCE_AICORE__ == 220 && defined(__DAV_C220_VEC__)
+#if defined(__DAV_VEC__)
   set_mask_norm();
   set_vector_mask(-1, -1);
 
@@ -414,4 +415,14 @@ extern "C" void call_swiglu_kernel(uint32_t blockDim, void* stream, uint8_t* x,
                                    uint8_t* y, uint32_t batch,
                                    uint32_t input_n) {
   swiglu_fp16<<<blockDim * 2, nullptr, stream>>>(x, y, batch, input_n);
+}
+
+// Host-callable launch shims: the `<<<>>>` syntax is only
+// understood by the kernel compiler, so the launch lives here
+// rather than in the host wrappers under csrc/host/.
+extern "C" void pto_launch_swiglu_fp16(uint32_t blockDim, void* stream, void* x,
+                                       void* y, uint32_t batch,
+                                       uint32_t input_n) {
+  swiglu_fp16<<<blockDim, nullptr, stream>>>((GM_ADDR)x, (GM_ADDR)y, batch,
+                                             input_n);
 }
