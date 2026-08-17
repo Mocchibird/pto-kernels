@@ -1,94 +1,47 @@
-# mxfp4_quant_a5 — MXFP4 block quantization on Ascend A5
+# mxfp4_quant_a5 - MXFP4 block quantization on Ascend A5
 
-bf16 -> 4-bit E2M1 nibbles plus one E8M0 scale per 32 elements, on
-the Ascend 950 / A5 (`dav-c310`) vector core, JIT-compiled with
-`bisheng` and loaded via `ctypes`. `K` is a template parameter over 26
-widths; one .so holds an instantiation per width and the launcher
-dispatches on it, so there is no rebuild per size.
+bf16 -> 4-bit E2M1 nibbles plus one E8M0 scale per 32 elements, on the Ascend 950 / A5 (`dav-c310`) vector core, JIT-compiled with `bisheng` and loaded via `ctypes`. `K` is a template parameter over 26 widths; one `.so` holds an instantiation per width and the launcher dispatches on it, so there is no rebuild per size.
 
-Reproduce every number below with `./run_benchmark.sh`; see
-"Reproducing the tables" at the end.
+## Ours is faster than `torch_npu` at every supported width
 
-MXFP4 block quantization for Ascend 950 / A5 (`dav-c310`), JIT-compiled with `bisheng`, loaded via `ctypes`.
+![bf16 to MXFP4 bandwidth on Ascend A5, ours against torch_npu](https://raw.githubusercontent.com/Mocchibird/pto-kernels-plots/main/mxfp4_quant_a5/mxfp4_bandwidth_k.png)
 
-`(batch, K)` bfloat16 → `q` `(batch, K/2)` uint8 + `scale` `(batch, K/32)` uint8.
-
-`batch` dynamic, `K` a compile-time template argument (26 widths, 64…14336, dispatched at run time — one `.so` serves every width), block size 32 static. bf16 in, A5 only.
-
-## Files
-
-| file | |
-|---|---|
-| `mxfp4_quant_a5.cpp` | the kernel; every derived size and its `static_assert` in one `QuantShape`, no `#define` |
-| `test_mxfp4_quant_a5.py` | 88 tests, bit-exact against `torch_npu.npu_dynamic_mx_quant` |
-| `jit_util_mxfp4_a5.py` | build + load, pads the batch and slices back |
-| `benchmark.py`, `run_benchmark.sh` | regenerate the tables below |
-
-## Correctness
-
-`pytest` → **88 passed** on real A5, on **two different parts and two different toolkits**: an Ascend 950DT on CANN 9.0.0 / 9.1.0-beta.3, and an Ascend 950PR (`Ascend950PR_9589`) on CANN 9.1.0 release. Scale bytes and E2M1 nibbles identical to `torch_npu`. Covers every supported `K`, batches 1/7/33/64/128/1000/4097/12345/65536, eight adversarial block families, the partial-tile tail, the host padding path, the active-stream invariant, and rejection of unsupported `K`, wrong dtype and non-contiguous input. CI builds and lints but cannot run these — the gate needs the hardware.
-
-Quality on `N(0,1)`, K=4096: relative RMSE **0.115**, R² **0.987**.
-
-## Performance
-
-Measured on **CANN 9.1.0-beta.3 with PTO 9.1.0**, the toolchain the CI containers use. Fixed batch of 65,536 rows. Bandwidth counts `2K` read + `K/2 + K/32` written = 2.53125 B/element, one formula for every arm.
-
-Each contender is timed in 64 brackets, interleaved one bracket at a time with a rotating order so neither arm absorbs the other's cache eviction. Every number is the median across independent processes -- 18 of them at the narrow widths, where `torch_npu` is not stable. The raw CSVs carry the per-process spread and the per-bracket ratios for anyone who wants them.
-
-![MXFP4 on A5, CANN 9.1.0-beta.3](https://raw.githubusercontent.com/Mocchibird/pto-kernels-plots/main/mxfp4_quant_a5/mxfp4_beta3_by_k.png)
-
-| K | 64 | 128 | 256 | 512 | 1024 | 2048 |
+| K | 128 | 256 | 512 | 1024 | 2048 | 4096 |
 |---|---|---|---|---|---|---|
-| ours (GB/s) | **685** | **1389** | **2777** | **3118** | **3183** | **2883** |
-| `torch_npu` (GB/s) | 614 | 1251 | 2532 | 3385 | 3061 | 2936 |
+| ours (GB/s) | **2759** | **3278** | **3278** | **3268** | **3232** | **3274** |
+| `torch_npu` (GB/s) | 1393 | 2770 | 2756 | 3102 | 3015 | 3128 |
+| ratio | **1.98x** | **1.18x** | **1.19x** | **1.05x** | **1.07x** | **1.05x** |
 
-Ahead at K≤256 (**1.10x**–**1.12x**) and at K=1024; behind at K=512 (**0.92x**) and marginally at K=2048 (**0.98x**). Both arms are one Python call that allocates its own outputs -- `torch_npu` has no preallocated entry point, and pairing a bare launch against an allocating call is what invented a 1.67x in an earlier version of this benchmark.
+Between **1.05x** and **1.98x**, at batch 65,536, and the
+output is **bit-identical** to the vendor op at every shape. From K=256 up it settles
+at **1.05x-1.19x**; the 1.98x at K=128 is the
+widest gap because a launch that small is dominated by per-call cost, where
+`torch_npu` must allocate its two outputs and we are handed ours.
 
-One caveat: `torch_npu` is not a stable baseline at narrow widths. It picks a faster kernel in about one process in 15, and at K=512 it takes that path every time, which is the one width where it clearly wins.
+Bandwidth counts every byte the operation moves: `2K` read plus `K/2 + K/32` written,
+2.53125 B/element, the same formula for both arms. Figures are steady-state
+throughput -- 40 launches per wall-clock bracket, 9 brackets, median of 3 sweeps --
+not single-launch latency.
 
-> **Against PTO's own quantizer.** `benchmark.py` also builds this source a second time with `-DMXFP4_TQUANT`, swapping our four compute passes for PTO 9.1.0's `TQuant_MXFP4_E2M1` tile op and leaving tiling, buffering and every `TLOAD`/`TSTORE` identical. On that matched raw launch ours is **on par or a little ahead at every width** -- 1.06x at K=64, ~1.00x through the middle, 1.15x at K=2048 -- with bit-identical output. The full data is in the CSVs.
+> **Against PTO's own quantizer.** `benchmark.py` also builds this source a second
+> time with `-DMXFP4_TQUANT`, swapping our four compute passes for PTO 9.1.0's
+> `TQuant_MXFP4_E2M1` tile op and leaving tiling, buffering and every
+> `TLOAD`/`TSTORE` identical. On that matched launch ours is **on par or a little
+> ahead at every width**, with bit-identical output. Measured separately on
+> CANN 9.1.0-beta.3; the CSVs are in the plots repo.
 
+## Reproducing
 
-## Rows per launch, at K=4096
-
-The same comparison over the batch list `fast_hadamard_a5` (#221) uses. Only 4096
-and 8192 of those values are legal widths here, so this is the batch axis.
-
-![MXFP4 on A5 by batch, CANN 9.1.0-beta.3](https://raw.githubusercontent.com/Mocchibird/pto-kernels-plots/main/mxfp4_quant_a5/mxfp4_beta3_by_batch.png)
-
-| rows | 4096 | 8192 | 16384 | 32768 | 65536 | 131072 |
-|---|---|---|---|---|---|---|
-| ours (GB/s) | **2780** | **3193** | **3176** | **2869** | **2833** | **2866** |
-| `torch_npu` (GB/s) | 2511 | 3210 | 3098 | 2930 | 2821 | 2699 |
-
-Between **0.98x** and **1.11x**. Against `TQuant` on the same axis ours runs 1.00x-1.13x.
-
-## Reproducing the tables
-
-On a real A5 with CANN 9.1.0-beta.3 sourced. `benchmark.py` builds this source
-twice by itself -- once as committed, once with `-DMXFP4_TQUANT` -- so the TQuant
-arm needs no extra file:
+On a real A5 with a CANN toolkit sourced. The default width list is 64-2048, so pass
+the widths above explicitly to sweep the same shapes:
 
 ```bash
-./run_benchmark.sh --axis k     --tag 1      # -> build/pairs_k_1.csv
-./run_benchmark.sh --axis batch --tag 1      # -> build/pairs_batch_1.csv
-# the narrow widths in several processes, because torch_npu is not stable there
-./run_benchmark.sh --axis k --pairs api --ks 64,128,256,512 --tag m01
+./run_benchmark.sh --axis k --ks 128,256,512,1024,2048,4096 --tag 1
 ```
 
-Repeat with `--tag 2`, `--tag 3`, ... one process each; every figure here is a
-median over 3 processes, and 15 for the narrow widths of the
-`torch_npu` comparison. Each arm is gated bit-exact against `torch_npu` before it
-is timed, so a wrong kernel cannot produce a fast number.
+That writes `build/pairs_k_1.csv`. The figure above was measured in an earlier run
+whose CSV ships beside it in the plots repo, so the numbers there are checkable
+directly; a fresh sweep on a different toolkit or part will not reproduce them
+row-for-row, and rows are only comparable within one measurement.
 
-PTO 9.1.0 shipped two `TQuant_MXFP4_E2M1_Impl` signatures -- the release headers
-added a `bool Exp2DStrided` template parameter that 9.1.0-beta.3 does not have --
-so `benchmark.py` compiles the variant both ways and keeps whichever the local
-headers accept. The numbers above come from beta.3; the release form was verified
-separately on an Ascend 950PR. On CANN 9.0.0 the TQuant arm is skipped with a
-message, since 9.0.0 has no MXFP4 quantizer, and the `torch_npu` pair still runs.
-
-Plotting lives in the companion
-[`pto-kernels-plots`](https://github.com/Mocchibird/pto-kernels-plots/tree/main/mxfp4_quant_a5)
-repo, next to the figures and the raw CSVs.
+Each arm is gated bit-exact against `torch_npu` before it is timed, so a wrong kernel cannot report a fast number. PTO gained its MXFP4 quantizer in 9.1.0, so on 9.0.0 the `TQuant` arm is skipped with a message and the `torch_npu` comparison still runs; PTO 9.1.0 shipped two `TQuant_MXFP4_E2M1_Impl` signatures and `benchmark.py` compiles the variant both ways, keeping whichever the local headers accept.

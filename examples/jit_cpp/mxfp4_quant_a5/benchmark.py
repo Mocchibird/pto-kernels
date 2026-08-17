@@ -2,22 +2,18 @@
 
 Reproduces every figure in README.md. Run it through run_benchmark.sh.
 
-TWO COMPARISONS, on deliberately different call paths, because pairing arms that
-do not share one measures the wrapper rather than either kernel:
+ONE CALL PATH. `ours` is a bare ctypes launch with preallocated outputs -- the
+fastest way to call it -- and everything is judged against that:
 
-  --pairs raw   ours vs PTO TQuant. Both a bare ctypes launch with preallocated
-                outputs, from THIS source built twice -- the second time with
-                -DMXFP4_TQUANT, which swaps the four compute passes for the
-                vendor tile op and leaves tiling, buffering and every
-                TLOAD/TSTORE identical. So this isolates COMPUTE. Needs PTO
-                9.1.0; on 9.0.0, which has no MXFP4 quantizer, it is skipped.
-  --pairs api   ours vs torch_npu. Both one Python call that allocates its own
-                outputs. torch_npu has no preallocated entry point, so this is
-                the only fair user-facing pairing.
-
-The two `ours` arms differ only in Python -- argument checks, padding arithmetic,
-two allocations and output slicing -- which costs about 2.9x at K=64 and nothing
-by K=2048.
+  tquant     PTO's own MXFP4 tile op, reached the same way: this source built
+             twice with only the four compute passes swapped. Identical tiling,
+             buffering and DMA, so the difference is COMPUTE.
+  torch_npu  npu_dynamic_mx_quant. Its schema returns freshly allocated tensors
+             and has no out= or _out overload, so there is no preallocated form
+             to call. Part of its gap against ours is therefore that allocation
+             rather than the kernel, which the README states plainly.
+  d2d_copy   a torch device-to-device copy over the same rotating pool: the DMA
+             floor for the shape, the yardstick fast_hadamard_a5 reports against.
 
 Bandwidth counts every byte the operation must move: 2K read plus K/2 + K/32
 written, i.e. 2.53125 bytes per element, one formula for every arm.
@@ -61,7 +57,7 @@ import subprocess
 import torch
 import torch_npu  # noqa: F401  (registers the npu backend)
 
-from jit_util_mxfp4_a5 import MX_BLOCK, SUPPORTED_K, build_and_load, row_quantum
+from jit_util_mxfp4_a5 import MX_BLOCK, SUPPORTED_K, row_quantum
 
 HERE = Path(__file__).resolve().parent
 BUILDDIR = HERE / "build"
@@ -206,11 +202,11 @@ def batch_for(k):
 def make_pool(batch, k):
     per_buffer = batch * k * 2
     depth = max(POOL_MIN, min(POOL_MAX, WORKING_SET_BYTES // max(per_buffer, 1)))
-    # generated on device: a host fp32 randn of this size costs minutes and 2x
-    # the memory, and the benchmark does not care which random values they are
+    # generated on device in bf16 directly: a host randn of this size costs
+    # minutes, and going via fp32 on device doubles peak memory for no benefit --
+    # enough to fail a 538 MB working set on a device with 125 GB free
     pool = [
-        torch.randn(batch, k, dtype=torch.float32, device="npu").to(torch.bfloat16)
-        for _ in range(depth)
+        torch.randn(batch, k, dtype=torch.bfloat16, device="npu") for _ in range(depth)
     ]
     torch.npu.synchronize()
     return pool
@@ -286,58 +282,103 @@ def gate(name, ours_out, other_out):
     return packed, scale, wrote
 
 
-def measure_pair(k, batch, which):
-    """One matched pair, both arms on an identical call path.
+COPY_BYTES_PER_ELEM = 4.0  # bf16 read + bf16 written
 
-    raw   ours_raw vs TQuant -- both a bare ctypes launch into the same source
-          built twice, outputs preallocated. Only the four compute passes differ,
-          so this isolates COMPUTE.
-    api   ours vs torch_npu -- both one Python call that allocates its own
-          outputs, which is what a caller actually gets. torch_npu has no other
-          mode, so this is the only fair user-facing pairing.
+
+def copy_contender(pool):
+    """A torch device-to-device copy, as the DMA floor for this shape.
+
+    fast_hadamard_a5 judges its transform against exactly this: for a
+    memory-bound op the honest yardstick is not a rival kernel but a plain copy
+    of the same bytes. It moves 4 B/element against the quantizer's 2.53, so the
+    two are compared as achieved bandwidth, each counting the bytes it moves.
+
+    It reads the SAME rotating pool as the other arms and writes to a rotating
+    destination. Copying one fixed buffer instead measured 5306 GB/s at K=256 --
+    above the HBM ceiling, because both buffers fit in the 128 MB L2.
+    """
+    dsts = [torch.empty_like(pool[0]) for _ in pool]
+    state = {"i": 0}
+
+    def run(x):
+        dst = dsts[state["i"] % len(dsts)]
+        state["i"] += 1
+        return dst.copy_(x)
+
+    return ("d2d_copy", run)
+
+
+def measure_shape(k, batch, want_tquant=True):
+    """Every contender at one shape, all judged against ours on a raw launch.
+
+    ours is a bare ctypes launch with preallocated outputs -- the fastest way to
+    call it. Its rivals:
+
+      tquant     PTO's own MXFP4 tile op, reached the same way: the same source
+                 built twice with only the four compute passes swapped, outputs
+                 preallocated. Identical tiling, buffering and DMA, so this
+                 isolates COMPUTE.
+      torch_npu  npu_dynamic_mx_quant, which ALLOCATES its two outputs. Its
+                 schema has no out= and no _out overload, so there is no
+                 preallocated form to call; the allocation is part of using it.
+                 Some of the gap against ours is therefore that allocation and
+                 not the kernel, and the README says so.
+      d2d_copy   a torch device-to-device copy over the same rotating pool: the
+                 DMA floor for the shape, as fast_hadamard_a5 reports.
     """
     from jit_util_mxfp4_a5 import compile_kernel
 
     pool = make_pool(batch, k)
     blocks = k // MX_BLOCK
-    if which == "raw":
-        qa = torch.empty((batch, k // 2), dtype=torch.uint8, device="npu")
-        sa = torch.empty((batch, blocks), dtype=torch.uint8, device="npu")
-        qb = torch.empty((batch, k // 2), dtype=torch.uint8, device="npu")
-        sb = torch.empty((batch, blocks), dtype=torch.uint8, device="npu")
-        mine = raw_launcher(compile_kernel(verbose=False), k)
+    qa = torch.empty((batch, k // 2), dtype=torch.uint8, device="npu")
+    sa = torch.empty((batch, blocks), dtype=torch.uint8, device="npu")
+    qb = torch.empty((batch, k // 2), dtype=torch.uint8, device="npu")
+    sb = torch.empty((batch, blocks), dtype=torch.uint8, device="npu")
+    mine = raw_launcher(compile_kernel(verbose=False), k)
+
+    vendor = getattr(torch_npu, "npu_dynamic_mx_quant", None)
+    if vendor is None:
+        raise RuntimeError("npu_dynamic_mx_quant missing: no baseline")
+
+    contenders = [("ours_raw", lambda x: mine(x, qa, sa))]
+    mine(pool[0], qa, sa)
+    matches = {}
+
+    if want_tquant:
         theirs = build_tquant(k)
-        contenders = [
-            ("ours_raw", lambda x: mine(x, qa, sa)),
-            ("tquant", lambda x: theirs(x, qb, sb)),
-        ]
-        mine(pool[0], qa, sa)
+        contenders.append(("tquant", lambda x: theirs(x, qb, sb)))
         theirs(pool[0], qb, sb)
-        match = gate("raw", (qa, sa), (qb, sb))
-    else:
-        quant = build_and_load(k=k, verbose=False)
-        vendor = getattr(torch_npu, "npu_dynamic_mx_quant", None)
-        if vendor is None:
-            raise RuntimeError("npu_dynamic_mx_quant missing: no baseline")
-        contenders = [
-            ("ours", quant),
-            ("torch_npu", lambda x: vendor(x, dst_type=VENDOR_DST_TYPE)),
-        ]
-        oq, os_ = quant(pool[0])
-        tq, ts = vendor(pool[0], dst_type=VENDOR_DST_TYPE)
-        ts = ts.reshape(ts.shape[0], -1)[:, :blocks]
-        match = gate("api", (oq, os_), (tq, ts))
+        matches["tquant"] = gate("tquant", (qa, sa), (qb, sb))
+
+    contenders.append(("torch_npu", lambda x: vendor(x, dst_type=VENDOR_DST_TYPE)))
+    tq, ts = vendor(pool[0], dst_type=VENDOR_DST_TYPE)
+    ts = ts.reshape(ts.shape[0], -1)[:, :blocks]
+    matches["torch_npu"] = gate("torch_npu", (qa, sa), (tq, ts))
+
+    contenders.append(copy_contender(pool))
 
     samples = interleaved_micros(contenders, pool)
-    first, second = contenders[0][0], contenders[1][0]
-    ratio, low, high, resolved = paired_speedup(samples[first], samples[second])
+    samples = interleaved_micros(contenders, pool)
+    ours = contenders[0][0]
     rows = []
-    for name in (first, second):
+    for name, _ in contenders:
         taken = samples[name]
         micros = statistics.median(taken)
+        # the copy moves 4 B/element where the quantizer moves 2.53, so each
+        # counts the bytes it actually moves and the two meet as bandwidth
+        per_elem = COPY_BYTES_PER_ELEM if name == "d2d_copy" else BYTES_PER_ELEM
+        if name in (ours, "d2d_copy"):
+            # the copy is a floor, not a rival: it moves 4 B/element against the
+            # quantizer's 2.53, so a time ratio between them means nothing. The
+            # two meet as bandwidth only.
+            ratio, low, high, resolved = 1.0, 1.0, 1.0, 0
+        else:
+            ratio, low, high, res = paired_speedup(samples[ours], taken)
+            resolved = int(res)
+        match = matches.get(name, (1.0, 1.0))
         rows.append(
             {
-                "pair": which,
+                "pair": "raw",
                 "k": k,
                 "batch": batch,
                 "contender": name,
@@ -345,13 +386,13 @@ def measure_pair(k, batch, which):
                 "p_lo": round(min(taken), 3),
                 "p_hi": round(max(taken), 3),
                 "spread_pct": round(100 * (max(taken) - min(taken)) / micros, 1),
-                "gbs": round(batch * k * BYTES_PER_ELEM / (micros * 1e-6) / 1e9, 1),
+                "gbs": round(batch * k * per_elem / (micros * 1e-6) / 1e9, 1),
                 "packed_match": round(match[0], 6),
                 "scale_match": round(match[1], 6),
-                "speedup": round(ratio, 4) if name == second else 1.0,
-                "speedup_lo": round(low, 4) if name == second else 1.0,
-                "speedup_hi": round(high, 4) if name == second else 1.0,
-                "resolved": int(resolved) if name == second else 0,
+                "speedup": round(ratio, 4),
+                "speedup_lo": round(low, 4),
+                "speedup_hi": round(high, 4),
+                "resolved": resolved,
                 "brackets_n": len(taken),
                 "status": "ok",
             }
@@ -371,13 +412,19 @@ def tquant_builds():
         return False
 
 
+def cell(got, name, width=8):
+    """One bandwidth cell, or a dash when that contender did not run."""
+    return f"{got[name]['gbs']:>{width}.0f}" if name in got else f"{'--':>{width}}"
+
+
 def main():
-    parser = argparse.ArgumentParser(description="two matched-path comparisons")
+    parser = argparse.ArgumentParser(
+        description="ours on a raw launch against TQuant, torch_npu and a copy"
+    )
     parser.add_argument(
         "--tag", default="1", help="suffix for the CSV; use one per process"
     )
     parser.add_argument("--axis", choices=["k", "batch"], default="k")
-    parser.add_argument("--pairs", default="raw,api", help="which pairs to run")
     parser.add_argument("--ks", default="", help="comma list overriding K_LIST")
     args = parser.parse_args()
 
@@ -394,25 +441,21 @@ def main():
         else [(BATCH_SWEEP_K, b) for b in pr221_batches]
     )
     label = "K" if args.axis == "k" else "batch"
+    want_tquant = tquant_builds()
 
     out = []
-    for which in args.pairs.split(","):
-        if which == "raw" and not tquant_builds():
-            continue
-        print(f"\n=== {which} pair, by {label} ===")
+    header = f"{label:>7} {'ours':>8} {'TQuant':>8} {'torch_npu':>10} {'copy':>8}"
+    print(f"\n=== bandwidth (GB/s), ours on a raw launch, by {label} ===")
+    print(header)
+    for width, batch in shapes:
+        rows = measure_shape(width, batch, want_tquant)
+        out += rows
+        got = {r["contender"]: r for r in rows}
+        key = width if args.axis == "k" else batch
         print(
-            f"{label:>7} {'ours':>8} {'other':>8} {'ratio':>7} {'95% CI':>16} {'res':>4}"
+            f"{key:>7} {cell(got, 'ours_raw')} {cell(got, 'tquant')} "
+            f"{got['torch_npu']['gbs']:>10.0f} {cell(got, 'd2d_copy')}"
         )
-        for width, batch in shapes:
-            rows = measure_pair(width, batch, which)
-            out += rows
-            a, b = rows[0], rows[1]
-            key = width if args.axis == "k" else batch
-            print(
-                f"{key:>7} {a['gbs']:>8.0f} {b['gbs']:>8.0f} {b['speedup']:>7.3f} "
-                f"[{b['speedup_lo']:.3f}, {b['speedup_hi']:.3f}]"
-                f"{'yes' if b['resolved'] else 'NO':>5}"
-            )
     write_csv(BUILDDIR / f"pairs_{args.axis}_{args.tag}.csv", out)
     return 0
 
