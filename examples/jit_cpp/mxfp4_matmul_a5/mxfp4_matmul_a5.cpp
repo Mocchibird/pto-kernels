@@ -148,11 +148,15 @@ static_assert(L1_SETS <= 3u, "only two and three sets are wired up");
 // Output tiles are walked SWIZZLE_GROUP rows down before stepping across, so
 // the blocks resident at one time form a square-ish patch of the output rather
 // than a full-width strip. 1 restores the plain row-major walk.
-#ifndef MXMM_SWIZZLE
-#define MXMM_SWIZZLE 8
-#endif
-constexpr uint32_t SWIZZLE_GROUP = (uint32_t)(MXMM_SWIZZLE);
-static_assert(SWIZZLE_GROUP >= 1u, "a group spans at least one tile row");
+//
+// The right group depends on how many N tiles there are, so the default is
+// chosen per instantiation from n_tiles rather than fixed: a group of 2 is
+// worth 7-11% once n_tiles reaches 48, and is neutral to slightly worse below
+// that, where 8 holds. 16 is worse at every width measured. -DMXMM_SWIZZLE
+// overrides it. The numbers behind the threshold are in README.md.
+constexpr uint32_t SWIZZLE_WIDE_TILES = 48u;
+constexpr uint32_t SWIZZLE_WIDE = 2u;
+constexpr uint32_t SWIZZLE_NARROW = 8u;
 constexpr unsigned BASE_SK = BASE_K / SCALE_FACTOR;
 
 static_assert(SMALL_M % 16 == 0 && BIG_M % 16 == 0, "M must be 16-aligned");
@@ -303,6 +307,13 @@ __global__ AICORE void mxfp4_matmul(__gm__ void *a_gm, __gm__ void *a_scale_gm,
 
   const uint32_t m_tiles = m_total / BASE_M;
   constexpr uint32_t n_tiles = N / BASE_N;
+#ifdef MXMM_SWIZZLE
+  constexpr uint32_t SWIZZLE_GROUP = (uint32_t)(MXMM_SWIZZLE);
+#else
+  constexpr uint32_t SWIZZLE_GROUP =
+      n_tiles >= SWIZZLE_WIDE_TILES ? SWIZZLE_WIDE : SWIZZLE_NARROW;
+#endif
+  static_assert(SWIZZLE_GROUP >= 1u, "a group spans at least one tile row");
   constexpr uint32_t k_tiles = K / BASE_K;
   constexpr uint32_t k_slabs = K / K_L1;
   static_assert(K % K_L1 == 0u, "K must be whole L1 slabs");
