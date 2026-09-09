@@ -213,9 +213,20 @@ remaining distance is known rather than mysterious:
   gain shows only at K=N=8192 and is 1.01x at 4096, so at 4096 the kernel is
   bound by something else.
 * **Double-buffering the accumulator**, so the cube does not idle while a tile
-  drains. One accumulator at the current tile is `BASE_M x BASE_N` fp32, which
-  is 128 KB exactly; a second doubles that, so this is bounded by L0C capacity
-  and may need a narrower N tile. Not measured here.
+  drains — available at the 128-row tile and impossible at the 256-row one.
+  A5 L0C is 256 KB (`PTO_L0C_SIZE_BYTES` under `PTO_NPU_ARCH_A5`), and PTO
+  enforces it directly:
+
+  ```
+  constexpr size_t accBytes = TileRes::Rows * TileRes::Cols * sizeof(CType);
+  static_assert(accBytes <= PTO_L0C_SIZE_BYTES,
+                "TMatmulMX:accumulator (Rows*Cols*sizeof(out)) exceeds L0C capacity.");
+  ```
+
+  The BIG tile's accumulator is 256x256 fp32 = 256 KB, which is the entire
+  L0C, so a second one cannot exist there. The SMALL tile's is 128x256 fp32 =
+  128 KB, where two fit exactly. An `Acc<float, 256, 512>` needs 512 KB and is
+  refused at compile time by that assert.
 * **The large-M column.** The ratio decays monotonically with M at every width,
   from 1.87x to 1.29x even at K=N=512, which points at the tile-selection rule
   rather than at the inner loop.
