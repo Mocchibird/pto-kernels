@@ -107,15 +107,17 @@ Two asymmetries, both stated rather than corrected:
   flat in size. At K=N=512 it is a few percent of the vendor arm and it
   flatters this kernel; there is no way to remove it through the public API.
 * Both arms have their dtype views and transposes hoisted out of the timed
-  region. Leaving the vendor's four `view`/`t`/`transpose` calls inside the
-  loop, which an earlier harness did, cost that arm 10–35% at small shapes and
-  moved `ours_vs_vendor` at M=16 K=N=1024 from 1.81x to 2.29x. Neither arm
-  should be charged for per-call metadata bookkeeping.
+  region. Leaving the vendor's six `view`/`t`/`transpose` calls inside the loop,
+  which an earlier harness did, costs that arm a flat **8.5–10.1 us per call**
+  — measured by A/B of the two constructions in one process, and flat across
+  shapes because it is host-side work. That is 10–35% at small shapes and moved
+  `ours_vs_vendor` at M=16 K=N=1024 from 1.81x to 2.29x. Neither arm should be
+  charged for per-call metadata bookkeeping.
 
-The same trap applies to this kernel's own wrapper: `load_matmul` re-derives
-the tile plan per call, which is three ctypes round-trips into the `.so` and
-measurable when the whole matmul is 20 us. Use `matmul.prepare(...)` for
-anything timed or hot, which is what `benchmark.py` does.
+This kernel's own wrapper has the identical trap in reverse: `load_matmul`
+re-derives the tile plan per call, three ctypes round-trips into the `.so`,
+which read 1.30x at that same shape. Use `matmul.prepare(...)` for anything
+timed or hot, as `benchmark.py` does.
 
 ### Method
 
