@@ -236,10 +236,20 @@ __global__ AICORE void mxfp4_matmul(__gm__ void *a_gm, __gm__ void *a_scale_gm,
                     K_L1, SLayout::RowMajor, 512>;
   using MatB = Tile<TileType::Mat, Fp4, K_L1, BASE_N, BLayout::RowMajor, K_L1,
                     BASE_N, SLayout::ColMajor, 512>;
-  using MatAS = Tile<TileType::Mat, E8m0, BASE_M, SK_L1, BLayout::RowMajor,
-                     BASE_M, SK_L1, SLayout::RowMajor, 32>;
-  using MatBS = Tile<TileType::Mat, E8m0, SK_L1, BASE_N, BLayout::ColMajor,
-                     SK_L1, BASE_N, SLayout::ColMajor, 32>;
+  // The scales are held for the WHOLE K of an output tile, not per slab.
+  // Per slab they were 256 rows of 16 bytes each -- 3% of the bytes moved and
+  // 50% of the DMA descriptors issued, on a kernel whose loads are bound by
+  // descriptor issue rather than bandwidth. Held whole, they are one load of
+  // 256 rows of SK_ALL bytes, so the burst becomes a full cache line at
+  // K >= 16384 and the descriptor count per output tile falls from
+  // 4 * k_slabs units to 2 * k_slabs + 2. The vendor does the same thing at a
+  // cadence of 4 slabs (mxmatmul_performance_kernel.cpp:20, mxScalePara);
+  // whole-K is the same idea taken as far as L1 allows.
+  constexpr uint32_t SK_ALL = K / SCALE_FACTOR;
+  using MatAS = Tile<TileType::Mat, E8m0, BASE_M, SK_ALL, BLayout::RowMajor,
+                     BASE_M, SK_ALL, SLayout::RowMajor, 32>;
+  using MatBS = Tile<TileType::Mat, E8m0, SK_ALL, BASE_N, BLayout::ColMajor,
+                     SK_ALL, BASE_N, SLayout::ColMajor, 32>;
 
   // L0, using the Compact variants the tuned reference uses.
   using Left = TileLeft<Fp4, BASE_M, BASE_K, BASE_M, BASE_K>;
@@ -252,8 +262,10 @@ __global__ AICORE void mxfp4_matmul(__gm__ void *a_gm, __gm__ void *a_scale_gm,
   // its extract and multiply. One set is 51 KB.
   MatA a_l1, a_l1b, a_l1c;
   MatB b_l1, b_l1b, b_l1c;
-  MatAS as_l1, as_l1b, as_l1c;
-  MatBS bs_l1, bs_l1b, bs_l1c;
+  // one scale pair, not one per set: it is loaded once per output tile and
+  // read by every extract, so it does not ping-pong with the data slabs
+  MatAS as_l1;
+  MatBS bs_l1;
   // L0 is double buffered too. One fp4 operand tile is 32 KB and L0A and L0B
   // are 64 KB each, so two sets fit exactly, which is why BASE_K stays 256:
   // (256,512,256) measures 1692 TF/s on the cube against 1653 here, but needs
@@ -266,31 +278,30 @@ __global__ AICORE void mxfp4_matmul(__gm__ void *a_gm, __gm__ void *a_scale_gm,
 
   constexpr uint32_t a_l1_bytes = (BASE_M * K_L1) >> SHIFT_FP4;
   constexpr uint32_t b_l1_bytes = (K_L1 * BASE_N) >> SHIFT_FP4;
+  // Data slabs first, L1_SETS of them, then the single whole-K scale pair.
+  constexpr uint32_t l1_set_bytes = a_l1_bytes + b_l1_bytes;
+  constexpr uint32_t scale_bytes = BASE_M * SK_ALL + SK_ALL * BASE_N;
   TASSIGN(a_l1, 0x0);
   TASSIGN(b_l1, a_l1_bytes);
-  TASSIGN(as_l1, a_l1_bytes + b_l1_bytes);
-  TASSIGN(bs_l1, a_l1_bytes + b_l1_bytes + BASE_M * SK_L1);
-  // the second set immediately after the first
-  constexpr uint32_t l1_set_bytes =
-      a_l1_bytes + b_l1_bytes + BASE_M * SK_L1 + SK_L1 * BASE_N;
   TASSIGN(a_l1b, l1_set_bytes);
   TASSIGN(b_l1b, l1_set_bytes + a_l1_bytes);
-  TASSIGN(as_l1b, l1_set_bytes + a_l1_bytes + b_l1_bytes);
-  TASSIGN(bs_l1b, l1_set_bytes + a_l1_bytes + b_l1_bytes + BASE_M * SK_L1);
   // The third set is assigned unconditionally and simply goes untouched at
   // L1_SETS == 2; an unused TASSIGN costs nothing at runtime.
   TASSIGN(a_l1c, 2u * l1_set_bytes);
   TASSIGN(b_l1c, 2u * l1_set_bytes + a_l1_bytes);
-  TASSIGN(as_l1c, 2u * l1_set_bytes + a_l1_bytes + b_l1_bytes);
-  TASSIGN(bs_l1c, 2u * l1_set_bytes + a_l1_bytes + b_l1_bytes + BASE_M * SK_L1);
+  TASSIGN(as_l1, L1_SETS * l1_set_bytes);
+  TASSIGN(bs_l1, L1_SETS * l1_set_bytes + BASE_M * SK_ALL);
   // L1 is 512 KB on this part, established by bisection: two sets of a
   // K_L1=512 slab are 272 KB and run exactly, two of a K_L1=1024 slab are
-  // 544 KB and fault at launch with 507015. So the widest double-buffered
-  // slab at the big output tile is 512, giving 256-byte GM->L1 bursts.
-  static_assert(
-      L1_SETS * (a_l1_bytes + b_l1_bytes + BASE_M * SK_L1 + SK_L1 * BASE_N) <=
-          512u * 1024u,
-      "L1 sets must fit the 512 KB L1");
+  // 544 KB and fault at launch with 507015.
+  //
+  // Holding the scales for the whole K costs 16*K bytes, which is 256 KB at
+  // K=16384 and exactly fills L1 beside two 128 KB data sets. Past that width,
+  // or with a third data set, it does not fit -- and this refuses to build
+  // rather than faulting on device.
+  static_assert(L1_SETS * l1_set_bytes + scale_bytes <= 512u * 1024u,
+                "the data sets plus the whole-K scale pair must fit the 512 KB "
+                "L1; reduce L1_SETS or K");
   constexpr uint32_t a_l0_bytes = (BASE_M * BASE_K) >> SHIFT_FP4;
   constexpr uint32_t b_l0_bytes = (BASE_K * BASE_N) >> SHIFT_FP4;
   static_assert(2u * a_l0_bytes <= 64u * 1024u, "two A tiles must fit L0A");
@@ -328,6 +339,13 @@ __global__ AICORE void mxfp4_matmul(__gm__ void *a_gm, __gm__ void *a_scale_gm,
   constexpr uint64_t bs_step = ((uint64_t)K * N) >> SHIFT_SCALE_FACTOR;
   const uint64_t o_step = (uint64_t)m_total * N * sizeof(bfloat16_t);
   const uint32_t work_items = out_tiles * groups;
+  // ID1 says the whole-K scales for this output tile have landed and ID3 that
+  // MTE1 has finished reading the previous tile's, so MTE2 may overwrite them.
+  // MTE2 runs ahead of MTE1 by design, which is the whole point of the L1
+  // pipeline, so the scale buffer needs the same release handshake the data
+  // sets get on ID2 -- without it a tile's scale load can land on top of
+  // scales the previous tile is still extracting.
+  bool scales_held = false;
   for (uint32_t w = get_block_idx(); w < work_items; w += core_count) {
     const uint32_t grp = w / out_tiles;
     const uint32_t t = w % out_tiles;
@@ -372,23 +390,26 @@ __global__ AICORE void mxfp4_matmul(__gm__ void *a_gm, __gm__ void *a_scale_gm,
 #define MXMM_NT_LOAD nt
 #endif
 
-#define MXMM_TILE_GM(kk)                                                   \
-  GmA a_g((__gm__ Fp4 *)a_gm_g +                                           \
-              (((uint64_t)MXMM_MT_LOAD * BASE_M * K + (uint64_t)(kk)) >>   \
-               SHIFT_FP4),                                                 \
-          DynShape(BASE_M, K_L1));                                         \
-  GmB b_g((__gm__ Fp4 *)b_gm_g +                                           \
-              (((uint64_t)MXMM_NT_LOAD * BASE_N * K + (uint64_t)(kk)) >>   \
-               SHIFT_FP4),                                                 \
-          DynShape(K_L1, BASE_N));                                         \
-  GmAS as_g((__gm__ E8m0 *)as_gm_g +                                       \
-                (((uint64_t)MXMM_MT_LOAD * BASE_M * K + (uint64_t)(kk)) >> \
-                 SHIFT_SCALE_FACTOR),                                      \
-            DynShape(BASE_M, SK_L1));                                      \
-  GmBS bs_g((__gm__ E8m0 *)bs_gm_g +                                       \
-                (((uint64_t)MXMM_NT_LOAD * BASE_N * K + (uint64_t)(kk)) >> \
-                 SHIFT_SCALE_FACTOR),                                      \
-            DynShape(SK_L1, BASE_N))
+#define MXMM_TILE_GM(kk)                                                 \
+  GmA a_g((__gm__ Fp4 *)a_gm_g +                                         \
+              (((uint64_t)MXMM_MT_LOAD * BASE_M * K + (uint64_t)(kk)) >> \
+               SHIFT_FP4),                                               \
+          DynShape(BASE_M, K_L1));                                       \
+  GmB b_g((__gm__ Fp4 *)b_gm_g +                                         \
+              (((uint64_t)MXMM_NT_LOAD * BASE_N * K + (uint64_t)(kk)) >> \
+               SHIFT_FP4),                                               \
+          DynShape(K_L1, BASE_N));                                       \
+  (void)0
+
+// The scale tensors are indexed by the output tile alone, not by the slab:
+// A's scales by its row panel and B's by its column panel, spanning all of K.
+#define MXMM_SCALE_GM()                                                        \
+  GmAS as_g((__gm__ E8m0 *)as_gm_g +                                           \
+                (((uint64_t)MXMM_MT_LOAD * BASE_M * K) >> SHIFT_SCALE_FACTOR), \
+            DynShape(BASE_M, SK_ALL));                                         \
+  GmBS bs_g((__gm__ E8m0 *)bs_gm_g +                                           \
+                (((uint64_t)MXMM_NT_LOAD * BASE_N * K) >> SHIFT_SCALE_FACTOR), \
+            DynShape(SK_ALL, BASE_N))
 
 // ATTRIBUTION SWITCHES, all three timing-only and all producing wrong output:
 //   -DMXMM_NO_LOAD     drops GM->L1, so the difference is the load
@@ -398,30 +419,38 @@ __global__ AICORE void mxfp4_matmul(__gm__ void *a_gm, __gm__ void *a_scale_gm,
 // The bottleneck moved once the loads were overlapped, so which stage binds now
 // has to be measured rather than assumed.
 #ifdef MXMM_NO_LOAD
-#define MXMM_FILL(a1, b1, as1, bs1) ((void)0)
+#define MXMM_FILL(a1, b1) ((void)0)
+#define MXMM_FILL_SCALES() ((void)0)
 #else
-#define MXMM_FILL(a1, b1, as1, bs1) \
-  do {                              \
-    TLOAD(a1, a_g);                 \
-    TLOAD(b1, b_g);                 \
-    TLOAD<MatAS, GmAS>(as1, as_g);  \
-    TLOAD<MatBS, GmBS>(bs1, bs_g);  \
+#define MXMM_FILL(a1, b1) \
+  do {                    \
+    TLOAD(a1, a_g);       \
+    TLOAD(b1, b_g);       \
+  } while (0)
+// Once per output tile, covering every slab's scales in one pair of loads.
+#define MXMM_FILL_SCALES()           \
+  do {                               \
+    MXMM_SCALE_GM();                 \
+    TLOAD<MatAS, GmAS>(as_l1, as_g); \
+    TLOAD<MatBS, GmBS>(bs_l1, bs_g); \
   } while (0)
 #endif
 
 #ifdef MXMM_NO_EXTRACT
-#define MXMM_DRAIN_TO_L0(a1, b1, as1, bs1, a0, b0, as0, bs0, sub) ((void)0)
+#define MXMM_DRAIN_TO_L0(a1, b1, a0, b0, as0, bs0, sub, tile) ((void)0)
 #else
-// sub is the tile's index within the slab. A holds K along its columns and B
-// along its rows, so the offset goes in a different argument for each.
-#define MXMM_DRAIN_TO_L0(a1, b1, as1, bs1, a0, b0, as0, bs0, sub) \
-  do {                                                            \
-    const uint16_t koff_ = (uint16_t)((sub) * BASE_K);            \
-    const uint16_t soff_ = (uint16_t)((sub) * BASE_SK);           \
-    TEXTRACT(a0, a1, 0, koff_);                                   \
-    TEXTRACT(b0, b1, koff_, 0);                                   \
-    TEXTRACT(as0, as1, 0, soff_);                                 \
-    TEXTRACT(bs0, bs1, soff_, 0);                                 \
+// sub is the tile's index within the slab and tile its index within the whole
+// K. A holds K along its columns and B along its rows, so the offset goes in a
+// different argument for each. The data offset is per slab; the scale offset
+// is per output tile, because one scale buffer spans all of K.
+#define MXMM_DRAIN_TO_L0(a1, b1, a0, b0, as0, bs0, sub, tile) \
+  do {                                                        \
+    const uint16_t koff_ = (uint16_t)((sub) * BASE_K);        \
+    const uint16_t soff_ = (uint16_t)((tile) * BASE_SK);      \
+    TEXTRACT(a0, a1, 0, koff_);                               \
+    TEXTRACT(b0, b1, koff_, 0);                               \
+    TEXTRACT(as0, as_l1, 0, soff_);                           \
+    TEXTRACT(bs0, bs_l1, soff_, 0);                           \
   } while (0)
 #endif
 
@@ -449,38 +478,47 @@ __global__ AICORE void mxfp4_matmul(__gm__ void *a_gm, __gm__ void *a_scale_gm,
     const uint32_t sel_ = (sel);               \
     MXMM_TILE_GM((uint64_t)(sl) * K_L1);       \
     if (sel_ == 0u) {                          \
-      MXMM_FILL(a_l1, b_l1, as_l1, bs_l1);     \
+      MXMM_FILL(a_l1, b_l1);                   \
     } else if (sel_ == 1u) {                   \
-      MXMM_FILL(a_l1b, b_l1b, as_l1b, bs_l1b); \
+      MXMM_FILL(a_l1b, b_l1b);                 \
     } else {                                   \
-      MXMM_FILL(a_l1c, b_l1c, as_l1c, bs_l1c); \
+      MXMM_FILL(a_l1c, b_l1c);                 \
     }                                          \
     set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0); \
   } while (0)
 // e is the global K-tile index. A slab's load is waited for once, before its
 // first sub-tile, and the set is released once, after its last -- so ID0 and
 // ID2 count slabs while ID4 and ID5 still count cube tiles.
-#define MXMM_EXTRACT(e, a0, b0, as0, bs0)                                     \
-  do {                                                                        \
-    const uint32_t e_ = (e);                                                  \
-    const uint32_t slab_ = e_ / K_SUB;                                        \
-    const uint32_t sub_ = e_ % K_SUB;                                         \
-    const uint32_t sel_ = slab_ % L1_SETS;                                    \
-    if (sub_ == 0u) {                                                         \
-      wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);                             \
-    }                                                                         \
-    if (sel_ == 0u) {                                                         \
-      MXMM_DRAIN_TO_L0(a_l1, b_l1, as_l1, bs_l1, a0, b0, as0, bs0, sub_);     \
-    } else if (sel_ == 1u) {                                                  \
-      MXMM_DRAIN_TO_L0(a_l1b, b_l1b, as_l1b, bs_l1b, a0, b0, as0, bs0, sub_); \
-    } else {                                                                  \
-      MXMM_DRAIN_TO_L0(a_l1c, b_l1c, as_l1c, bs_l1c, a0, b0, as0, bs0, sub_); \
-    }                                                                         \
-    if (sub_ + 1u == K_SUB) {                                                 \
-      set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);                              \
-    }                                                                         \
-    MXMM_POST_EXTRACT();                                                      \
+#define MXMM_EXTRACT(e, a0, b0, as0, bs0)                         \
+  do {                                                            \
+    const uint32_t e_ = (e);                                      \
+    const uint32_t slab_ = e_ / K_SUB;                            \
+    const uint32_t sub_ = e_ % K_SUB;                             \
+    const uint32_t sel_ = slab_ % L1_SETS;                        \
+    if (sub_ == 0u) {                                             \
+      wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);                 \
+    }                                                             \
+    if (sel_ == 0u) {                                             \
+      MXMM_DRAIN_TO_L0(a_l1, b_l1, a0, b0, as0, bs0, sub_, e_);   \
+    } else if (sel_ == 1u) {                                      \
+      MXMM_DRAIN_TO_L0(a_l1b, b_l1b, a0, b0, as0, bs0, sub_, e_); \
+    } else {                                                      \
+      MXMM_DRAIN_TO_L0(a_l1c, b_l1c, a0, b0, as0, bs0, sub_, e_); \
+    }                                                             \
+    if (sub_ + 1u == K_SUB) {                                     \
+      set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);                  \
+    }                                                             \
+    MXMM_POST_EXTRACT();                                          \
   } while (0)
+
+    // One pair of scale loads for the whole output tile, before the data
+    // prologue so it is the first thing MTE2 has queued.
+    if (scales_held) {
+      wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID3);
+    }
+    MXMM_FILL_SCALES();
+    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);
+    scales_held = true;
 
     // Prologue: LOOKAHEAD tiles are in flight before the first multiply, so
     // a tile's extract waits on a load issued LOOKAHEAD passes earlier
@@ -488,6 +526,9 @@ __global__ AICORE void mxfp4_matmul(__gm__ void *a_gm, __gm__ void *a_scale_gm,
     for (uint32_t j = 0u; j < LOOKAHEAD && j < k_slabs; ++j) {
       MXMM_LOAD(j, j % L1_SETS);
     }
+    // MTE1 blocks here until the scales are in L1; the prologue's data loads
+    // are already issued on MTE2, so this costs them nothing.
+    wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);
     for (uint32_t kt = 0; kt < k_tiles; ++kt) {
       const bool odd = (kt & 1u) != 0u;
       // One GM->L1 copy per slab, issued when the slab's first cube tile
@@ -556,6 +597,9 @@ __global__ AICORE void mxfp4_matmul(__gm__ void *a_gm, __gm__ void *a_scale_gm,
     for (uint32_t d = 0u; d < L1_SETS && d < k_slabs; ++d) {
       wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
     }
+    // Every extract in the loop above read the scale buffer, and MTE1 is in
+    // order, so one post here releases it for the next output tile.
+    set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID3);
 #ifndef MXMM_SINGLE_L0
     // Every multiply posts on ID5 and only the extracts of tile 2 and later
     // consume one, so min(k_tiles, 2) tokens are outstanding here.
@@ -565,7 +609,9 @@ __global__ AICORE void mxfp4_matmul(__gm__ void *a_gm, __gm__ void *a_scale_gm,
     }
 #endif
 #undef MXMM_TILE_GM
+#undef MXMM_SCALE_GM
 #undef MXMM_FILL
+#undef MXMM_FILL_SCALES
 #undef MXMM_DRAIN_TO_L0
 #ifndef MXMM_NO_STORE
     set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
@@ -583,6 +629,12 @@ __global__ AICORE void mxfp4_matmul(__gm__ void *a_gm, __gm__ void *a_scale_gm,
     wait_flag(PIPE_FIX, PIPE_M, EVENT_ID6);
 #endif
 #endif
+  }
+
+  // One ID3 post is outstanding: every tile posts and every tile but the first
+  // consumed one. Drain it so a later launch's first wait cannot return early.
+  if (scales_held) {
+    wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID3);
   }
 #else
   (void)a_gm;

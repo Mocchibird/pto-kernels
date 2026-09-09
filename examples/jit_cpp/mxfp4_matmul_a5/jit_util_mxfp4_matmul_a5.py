@@ -295,9 +295,17 @@ def load_matmul(so_path, k: int, n: int):
             for buf in (a, a_scale, b, b_scale, prepared_out)
         )
 
+        # The launcher holds the operand TENSORS, not only their addresses.
+        # Without this the caller's tensors can fall out of scope while the
+        # launcher lives on, the caching allocator hands that memory to
+        # whatever allocates next, and the kernel silently reads it -- which is
+        # a wrong answer with no error, and it cost a bitwise A/B a false
+        # mismatch before the cause was found.
+        held = (a, a_scale, b, b_scale, prepared_out)
+
         def launch():
             kernel(blocks, stream, *pointers, m_run, k, n)
-            return prepared_out
+            return held[-1]
 
         return launch, prepared_out
 
