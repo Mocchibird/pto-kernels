@@ -37,10 +37,10 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import torch  # noqa: E402
-import torch_npu  # noqa: E402
+import torch  # noqa
+import torch_npu  # noqa
 
-from jit_util_mxfp4_matmul_a5 import (  # noqa: E402
+from jit_util_mxfp4_matmul_a5 import (  # noqa
     MX_BLOCK,
     compile_kernel,
     load_matmul,
@@ -247,49 +247,50 @@ def main() -> int:
     print(f"  {torch.npu.get_device_name(0)}\n")
 
     done, had_rows = already_done(args.out)
-    output = open(args.out, "a", newline="", encoding="utf-8")
-    writer = csv.DictWriter(output, fieldnames=FIELDS)
-    if not had_rows:
-        writer.writeheader()
-        output.flush()
+    with open(args.out, "a", newline="", encoding="utf-8") as output:
+        writer = csv.DictWriter(output, fieldnames=FIELDS)
+        if not had_rows:
+            writer.writeheader()
+            output.flush()
 
-    header = (
-        f"  {'M':>6} {'run':>6} {'K=N':>6} {'bf16':>9} {'vendor':>9} "
-        f"{'ours':>9} {'o/v':>6} {'o/bf16':>7} {'reps':>5} {'spread':>7}"
-    )
-    print(header)
-    print("  " + "-" * (len(header) - 2))
+        header = (
+            f"  {'M':>6} {'run':>6} {'K=N':>6} {'bf16':>9} {'vendor':>9} "
+            f"{'ours':>9} {'o/v':>6} {'o/bf16':>7} {'reps':>5} {'spread':>7}"
+        )
+        print(header)
+        print("  " + "-" * (len(header) - 2))
 
-    added = 0
-    for kn in args.kn:
-        so = compile_kernel(kn, kn, verbose=False)
-        matmul = load_matmul(so, kn, kn)
-        plan = tile_plan(so)
-        for m in args.m:
-            if (m, kn) in done:
-                continue
-            m_run = plan(m)[0]
-            try:
-                row = measure(matmul, m, m_run, kn, source, destination, args.max_reps)
-            except (RuntimeError, ValueError) as error:
-                first = str(error).splitlines()[0][:60]
-                print(f"  {m:>6} {m_run:>6} {kn:>6}  skipped: {first}", flush=True)
-            else:
-                print(
-                    f"  {m:>6} {m_run:>6} {kn:>6} {row['bf16_us']:>9.2f} "
-                    f"{row['vendor_us']:>9.2f} {row['ours_us']:>9.2f} "
-                    f"{row['ours_vs_vendor']:>6.2f} {row['ours_vs_bf16']:>7.2f} "
-                    f"{row['reps']:>5} {row['spread_pct']:>6.1f}%",
-                    flush=True,
-                )
-                writer.writerow({**row, "copy_gbs": round(copy_gbs)})
-                output.flush()
-                added += 1
-            # The operands are held only by measure()'s frame, so returning
-            # drops them; at M=32768 K=N=16384 that matters within one sweep.
-            gc.collect()
-            torch.npu.empty_cache()
-    output.close()
+        added = 0
+        for kn in args.kn:
+            so = compile_kernel(kn, kn, verbose=False)
+            matmul = load_matmul(so, kn, kn)
+            plan = tile_plan(so)
+            for m in args.m:
+                if (m, kn) in done:
+                    continue
+                m_run = plan(m)[0]
+                try:
+                    row = measure(
+                        matmul, m, m_run, kn, source, destination, args.max_reps
+                    )
+                except (RuntimeError, ValueError) as error:
+                    first = str(error).splitlines()[0][:60]
+                    print(f"  {m:>6} {m_run:>6} {kn:>6}  skipped: {first}", flush=True)
+                else:
+                    print(
+                        f"  {m:>6} {m_run:>6} {kn:>6} {row['bf16_us']:>9.2f} "
+                        f"{row['vendor_us']:>9.2f} {row['ours_us']:>9.2f} "
+                        f"{row['ours_vs_vendor']:>6.2f} {row['ours_vs_bf16']:>7.2f} "
+                        f"{row['reps']:>5} {row['spread_pct']:>6.1f}%",
+                        flush=True,
+                    )
+                    writer.writerow({**row, "copy_gbs": round(copy_gbs)})
+                    output.flush()
+                    added += 1
+                # The operands are held only by measure()'s frame, so returning
+                # drops them; at M=32768 K=N=16384 that matters within one sweep.
+                gc.collect()
+                torch.npu.empty_cache()
     total = len(done) + added
     print(f"\n  +{added}, {total} of {len(args.m) * len(args.kn)} in {args.out}")
     return 0

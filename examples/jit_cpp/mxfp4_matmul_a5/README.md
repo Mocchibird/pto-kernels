@@ -180,19 +180,25 @@ L1 is 512 KB, and that bounds the slab. Two `K_L1=512` sets fit in 272 KB; two
 
 ```
 error: static assertion failed due to requirement
-'L1_SETS * l1_set_bytes + scale_bytes <= 512U * 1024U': the data sets plus
-the whole-K scale pair must fit the 512 KB L1; reduce L1_SETS or K
+'L1_SETS * kSlabBytes + kScaleBytes <= L1_BYTES': The data sets plus the
+whole-K scale pair must fit L1; reduce L1_SETS or K.
 ```
 
 `-DMXMM_K_L1=1024 -DMXMM_L1_SETS=1` does build, at the cost of the load/extract
 overlap.
 
-Tunable through `-D`, each with a `static_assert` that fires per instantiation
-so an unsupported combination cannot be built: `MXMM_BASE_M`, `MXMM_BASE_N`,
-`MXMM_K_L1`, `MXMM_L1_SETS` (1 or 2), `MXMM_SWIZZLE`, `MXMM_TINY_M`, and the
-build shape `MXMM_TEST_K` / `MXMM_TEST_N`. Every one of them produces correct
-output; the timing-only ablation switches used to attribute the bottleneck have
-been removed.
+Tunable through `-D`: `MXMM_BASE_M`, `MXMM_BASE_N`, `MXMM_K_L1`,
+`MXMM_L1_SETS` (1 or 2), `MXMM_SWIZZLE`, and the build shape `MXMM_TEST_K` /
+`MXMM_TEST_N`. Every one produces correct output; the timing-only ablation
+switches used to attribute the bottleneck have been removed.
+
+The derived sizes and their `static_assert`s live in one
+`TileShape<M_MAX, K, N, TILE_M, TILE_N>` struct, so an unsupported combination
+fails to instantiate rather than faulting on device. The launcher instantiates
+it three times, once per output tile.
+
+`MXMM_TINY_M` is gone. Its value was `M_ALIGN`, the 16-row floor TMATMUL_MX
+imposes, so it could not go lower and above it was simply another tile size.
 
 ## What would close the gap
 

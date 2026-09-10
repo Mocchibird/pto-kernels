@@ -28,7 +28,7 @@ torch_npu = pytest.importorskip("torch_npu")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from jit_util_mxfp4_matmul_a5 import (  # noqa: E402
+from jit_util_mxfp4_matmul_a5 import (  # noqa
     MX_BLOCK,
     compile_kernel,
     kernel_shape,
