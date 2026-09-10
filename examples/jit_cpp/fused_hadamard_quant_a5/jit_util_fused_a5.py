@@ -12,7 +12,7 @@ import subprocess
 from pathlib import Path
 
 import torch
-import torch_npu  # noqa: F401  (registers the npu backend)
+import torch_npu  # noqa
 
 HERE = Path(__file__).resolve().parent
 BUILDDIR = HERE / "build"
@@ -92,11 +92,6 @@ def compile_kernel(verbose=True, extra_defs=()):
 
 def current_stream_ptr():
     return ctypes.c_void_p(torch.npu.current_stream().npu_stream)
-
-
-def row_quantum(k):
-    """Rows per tile. The kernel pads a partial tile, so any batch is legal."""
-    return 1
 
 
 # The butterfly is the UNNORMALISED Sylvester matrix, so its output is sqrt(32)

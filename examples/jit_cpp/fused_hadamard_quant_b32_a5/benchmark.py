@@ -26,12 +26,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch_npu  # noqa: F401
+import torch_npu  # noqa
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from jit_util_fused_b32_a5 import (  # noqa: E402
+from jit_util_fused_b32_a5 import (  # noqa
     MX_BLOCK,
     build_and_load,
 )
@@ -124,14 +124,14 @@ def bench_ladder(k):
     t1, s1 = trials(one, depth)
     x.clear()
     torch.npu.empty_cache()
-    return dict(
-        k=k,
-        two_us=round(t2, 1),
-        fused_us=round(t1, 1),
-        vs_two=round(t2 / t1, 2),
-        rel=round(rel, 5),
-        spread_pct=round(max(s2, s1), 1),
-    )
+    return {
+        "k": k,
+        "two_us": round(t2, 1),
+        "fused_us": round(t1, 1),
+        "vs_two": round(t2 / t1, 2),
+        "rel": round(rel, 5),
+        "spread_pct": round(max(s2, s1), 1),
+    }
 
 
 def bench_copy(k):
@@ -155,16 +155,16 @@ def bench_copy(k):
     x.clear()
     dst.clear()
     torch.npu.empty_cache()
-    return dict(
-        k=k,
-        batch=batch,
-        fused_us=round(tf, 1),
-        copy_us=round(tc, 1),
-        vs_copy=round(tc / tf, 2),
-        fused_gbs=round(kernel_gbs),
-        copy_gbs=round(copy_gbs),
-        spread_pct=round(max(sf, sc), 1),
-    )
+    return {
+        "k": k,
+        "batch": batch,
+        "fused_us": round(tf, 1),
+        "copy_us": round(tc, 1),
+        "vs_copy": round(tc / tf, 2),
+        "fused_gbs": round(kernel_gbs),
+        "copy_gbs": round(copy_gbs),
+        "spread_pct": round(max(sf, sc), 1),
+    }
 
 
 def main():

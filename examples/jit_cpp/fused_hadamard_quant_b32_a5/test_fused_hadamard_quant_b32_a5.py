@@ -20,7 +20,7 @@ weakest:
 import numpy as np
 import pytest
 import torch
-import torch_npu  # noqa: F401
+import torch_npu  # noqa
 
 from jit_util_fused_b32_a5 import (
     MX_BLOCK,
@@ -72,7 +72,7 @@ def dequant(q, s, k):
     return vals.reshape(-1, k // MX_BLOCK, MX_BLOCK) * scale.unsqueeze(-1)
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="module", autouse=True)
 def seeded():
     torch.manual_seed(20260818)
     torch.npu.set_device(0)
@@ -103,7 +103,7 @@ WIDTHS = (32, 64, 96, 192, 256, 768, 896, 1024, 2816, 3584, 4096, 14336, 16384)
 
 
 @pytest.mark.parametrize("k", WIDTHS)
-def test_matches_reference(seeded, k):
+def test_matches_reference(k):
     """Scales exact, dequantized values within MXFP4 resolution."""
     batch = 64
     fused = build_and_load(k=k, verbose=False)
@@ -133,7 +133,7 @@ TILES_PER_CORE = 4
 
 
 @pytest.mark.parametrize("k", DEEP_WIDTHS)
-def test_matches_reference_many_tiles_per_core(seeded, k):
+def test_matches_reference_many_tiles_per_core(k):
     """The same check as test_matches_reference, but with a full pipeline.
 
     test_matches_reference uses batch=64, which at K=4096 is 11 tiles spread over
@@ -179,7 +179,7 @@ def test_matches_reference_many_tiles_per_core(seeded, k):
 
 
 @pytest.mark.parametrize("k", WIDTHS)
-def test_output_is_nontrivial(seeded, k):
+def test_output_is_nontrivial(k):
     """A kernel that writes nothing, or echoes its input, must fail here."""
     fused = build_and_load(k=k, verbose=False)
     x = torch.randn(32, k, dtype=torch.bfloat16, device="npu")
@@ -191,7 +191,7 @@ def test_output_is_nontrivial(seeded, k):
 
 
 @pytest.mark.parametrize("k", WIDTHS)
-def test_rotation_actually_happened(seeded, k):
+def test_rotation_actually_happened(k):
     """The rotation must change the answer.
 
     Quantizing x directly and quantizing (x @ H) should differ; if the fused
@@ -224,7 +224,7 @@ def unroll_width(k, rows):
     return limit
 
 
-def test_width_matrix_covers_both_unroll_classes(seeded):
+def test_width_matrix_covers_both_unroll_classes():
     """The matrix must exercise unroll-by-8 AND unroll-by-4.
 
     Guards the gap itself rather than one instance of it: the original five widths
@@ -257,7 +257,7 @@ def test_width_matrix_covers_both_unroll_classes(seeded):
 
 
 @pytest.mark.parametrize("k", (256, 96, 768))
-def test_constant_row_is_a_delta(seeded, k):
+def test_constant_row_is_a_delta(k):
     """A constant row becomes one delta per 32-block: a sharp structural check.
 
     H's first column is all ones, so each block sums into its own element 0 and
@@ -283,7 +283,7 @@ def test_constant_row_is_a_delta(seeded, k):
     )
 
 
-def test_unsupported_k_is_rejected(seeded):
+def test_unsupported_k_is_rejected():
     """Widths without an instantiation must raise on the host.
 
     The dispatch would otherwise fall through silently and hand back the caller's
@@ -294,7 +294,7 @@ def test_unsupported_k_is_rejected(seeded):
             build_and_load(k=bad, verbose=False)
 
 
-def test_wrong_dtype_is_rejected(seeded):
+def test_wrong_dtype_is_rejected():
     fused = build_and_load(k=256, verbose=False)
     for dtype in (torch.float16, torch.float32):
         with pytest.raises(TypeError):
