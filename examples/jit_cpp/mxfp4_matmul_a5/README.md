@@ -55,42 +55,42 @@ of which took the median of up to 100 interleaved reps.
 
 | K=N | ours / vendor | ours wins | ours peak | vendor peak | ours as % of vendor peak |
 |---|--:|--:|--:|--:|--:|
-| 512 | **1.83x** | 16/16 | 357 TF/s | 282 TF/s | 127% |
-| 1024 | **1.75x** | 16/16 | 770 | 750 | 103% |
-| 2048 | **1.63x** | 14/16 | 1196 | 1314 | 91% |
-| 3072 | **1.45x** | 13/16 | 1369 | 1514 | 90% |
-| 4096 | **1.31x** | 12/16 | 1398 | 1591 | 88% |
-| 6144 | 1.06x | 9/16 | 1362 | 1666 | 82% |
-| 8192 | 0.99x | 6/16 | 1235 | 1687 | 73% |
-| 12288 | 0.74x | 0/16 | 1409 | 1699 | 83% |
-| 16384 | 0.75x | 0/16 | 1408 | 1713 | 82% |
+| 512 | **1.86x** | 16/16 | 378 TF/s | 274 TF/s | 138% |
+| 1024 | **1.81x** | 16/16 | 807 | 732 | 110% |
+| 2048 | **1.68x** | 14/16 | 1244 | 1332 | 93% |
+| 3072 | **1.46x** | 14/16 | 1399 | 1513 | 92% |
+| 4096 | **1.41x** | 13/16 | 1490 | 1590 | 94% |
+| 6144 | **1.18x** | 12/16 | 1536 | 1662 | 92% |
+| 8192 | **1.03x** | 12/16 | 1555 | 1686 | 92% |
+| 12288 | 0.88x | 1/16 | 1591 | 1698 | 94% |
+| 16384 | 0.79x | 1/16 | 1607 | 1712 | 94% |
 
-The shape of it is one mechanism. The vendor kernel reaches 1687–1713 TF/s,
+The shape of it is one mechanism. The vendor kernel reaches 1686–1712 TF/s,
 which is the MXFP4 cube ceiling (1692 TF/s from the L0 format ratio), so at
-large K=N there is nothing left to win and this kernel's 82–88% of that ceiling
+large K=N there is nothing left to win and this kernel's 92–94% of that peak
 is the whole gap. At the other end the vendor is on a dispatch floor of about
-38 us — at K=N=512 it measures 38.1 us at M=1 and 38.4 us at M=1024, flat
+38 us — at K=N=512 it measures 38.0 us at M=1 and 39.6 us at M=1024, flat
 across three decades of work — and there it loses to a plain bf16 GEMM:
 
 | K=N | ours vs bf16 | vendor vs bf16 |
 |---|--:|--:|
-| 512 | 1.34x | 0.74x |
-| 1024 | 1.39x | 0.78x |
-| 2048 | 1.57x | 0.95x |
-| 4096 | 2.06x | 1.53x |
-| 8192 | 1.97x | 2.06x |
-| 16384 | 2.12x | 2.90x |
+| 512 | 1.35x | 0.72x |
+| 1024 | 1.35x | 0.75x |
+| 2048 | 1.59x | 0.94x |
+| 4096 | 2.21x | 1.49x |
+| 8192 | 2.16x | 2.05x |
+| 16384 | 2.28x | 2.92x |
 
 So this kernel beats bf16 at every width measured, and the vendor does not
 below K=N=3072.
 
 M matters as much as K=N, and in the same direction: more work per launch helps
-the vendor. At K=N=4096 this kernel runs 1.37x the vendor at M=16 and 0.88x at
+the vendor. At K=N=4096 this kernel runs 1.45x the vendor at M=16 and 0.94x at
 M=32768. The M at which it first falls behind drops sharply as K=N grows:
 
 | K=N | 512 | 1024 | 2048 | 3072 | 4096 | 6144 | 8192 | 12288 |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|
-| first losing M | never | never | 16384 | 8192 | 4096 | 512 | 2 | 1 |
+| first losing M | never | never | 16384 | 16384 | 8192 | 4096 | 4096 | 1 |
 
 `ours_vs_vendor` for all 144 cells is in the CSV.
 
@@ -227,7 +227,7 @@ large-M decay below.
 
 ## What would close the gap
 
-This kernel is at 82–88% of the cube ceiling where the vendor is at it, and the
+This kernel is at 88–95% of the cube ceiling where the vendor is at it, and the
 remaining distance is known rather than mysterious:
 
 * **`K_L1=1024`, for full 512-byte bursts — measured, and it does not pay.**
