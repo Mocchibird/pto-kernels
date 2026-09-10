@@ -87,7 +87,13 @@ constexpr uint32_t SWIZZLE_NARROW = 8u;
 #endif
 constexpr unsigned TEST_M_MAX = 65536;
 constexpr unsigned TEST_K = MXMM_TEST_K, TEST_N = MXMM_TEST_N;
-constexpr uint32_t TARGET_BLOCKS = 64u;
+// The block count the tile picker aims to fill. jit_util passes the device's
+// cube_core_num; the default is what an A5 reports.
+#ifndef MXMM_TARGET_BLOCKS
+#define MXMM_TARGET_BLOCKS 32
+#endif
+constexpr uint32_t TARGET_BLOCKS = (uint32_t)(MXMM_TARGET_BLOCKS);
+static_assert(TARGET_BLOCKS >= 1u, "At least one block.");
 
 namespace {
 

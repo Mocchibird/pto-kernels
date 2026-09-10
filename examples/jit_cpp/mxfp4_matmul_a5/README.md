@@ -188,8 +188,9 @@ whole-K scale pair must fit L1; reduce L1_SETS or K.
 overlap.
 
 Tunable through `-D`: `MXMM_BASE_M`, `MXMM_BASE_N`, `MXMM_K_L1`,
-`MXMM_L1_SETS` (1 or 2), `MXMM_SWIZZLE`, and the build shape `MXMM_TEST_K` /
-`MXMM_TEST_N`. Every one produces correct output; the timing-only ablation
+`MXMM_L1_SETS` (1 or 2), `MXMM_SWIZZLE`, the build shape `MXMM_TEST_K` /
+`MXMM_TEST_N`, and `MXMM_TARGET_BLOCKS`, which `jit_util` sets from the
+device's `cube_core_num` and which is part of the build cache key. Every one produces correct output; the timing-only ablation
 switches used to attribute the bottleneck have been removed.
 
 The derived sizes and their `static_assert`s live in one
@@ -199,6 +200,30 @@ it three times, once per output tile.
 
 `MXMM_TINY_M` is gone. Its value was `M_ALIGN`, the 16-row floor TMATMUL_MX
 imposes, so it could not go lower and above it was simply another tile size.
+
+### One block per core, and a tile rule that knows it
+
+`cube_core_num` is **32** on an Ascend950PR_9589, and two constants assumed
+64: the launcher capped `block_dim` at 64, so every core ran two blocks, and
+`TARGET_BLOCKS` — the count `pickMTile` wants filled before it will use the
+256-row tile — was 64, so the tall tile was withheld from shapes that already
+filled the machine.
+
+Three arms, interleaved with a cold L2, medians of three processes:
+
+| K=N, M | 64 blocks, target 64 | 32 blocks, target 64 | 32 blocks, target 32 | tile, last arm |
+|---|--:|--:|--:|---|
+| 2048, 1024 | 1.00x | 1.03x | **1.11x** | 128x256 -> 256x256 |
+| 4096, 512 | 1.00x | 1.03x | **1.11x** | 128x256 -> 256x256 |
+| 8192, 256 | 1.00x | 1.01x | **1.06x** | 128x256 -> 256x256 |
+| 4096, 1024 | 1.00x | 1.05x | 1.05x | 256x256 throughout |
+| 8192, 512 | 1.00x | 1.03x | 1.03x | 256x256 throughout |
+| 8192, 8192 | 1.00x | 1.00x | 0.99x | 256x256 throughout |
+
+Oversubscribing by 2:1 cost 1-5%, and the tile threshold cost a further 5-6%
+in the band where it changed the branch. Both are fixed by reading the core
+count off the device. Note the large-M control is flat, so this is not the
+large-M decay below.
 
 ## What would close the gap
 

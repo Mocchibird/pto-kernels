@@ -17,6 +17,7 @@ here instead. Use :func:`load_matmul`, which validates and then launches.
 """
 
 import ctypes
+import functools
 import os
 import subprocess
 from pathlib import Path
@@ -29,7 +30,29 @@ BASE_K = 256  # the cube's K tile; must match BASE_K in the kernel
 K_L1 = 512  # default L1 slab width; must match MXMM_K_L1
 N_ALIGN = 64  # TMATMUL_MX needs N 64-aligned for fp4
 M_ALIGN = 16  # and M 16-aligned
-MAX_BLOCK_DIM = 64  # cube blocks a launch may ask for on an A5
+DEFAULT_CUBE_CORES = 32  # what an A5 reports, and the fallback
+
+
+@functools.lru_cache(maxsize=1)
+def cube_core_count() -> int:
+    """Blocks a launch should ask for: one per cube core.
+
+    Read from the device rather than assumed. Asking for more than the device
+    has still computes the right answer -- the kernel's work loop strides by
+    the block count -- but it measured 1.00-1.05x slower than one block per
+    core, and the tile picker uses the same number to decide when a shape
+    fills the machine. Cached, because a property query per launch is the
+    per-call cost ``current_stream_ptr`` warns about.
+    """
+    import torch
+
+    try:
+        properties = torch.npu.get_device_properties(torch.npu.current_device())
+    except (AttributeError, RuntimeError):
+        return DEFAULT_CUBE_CORES
+    cores = int(getattr(properties, "cube_core_num", DEFAULT_CUBE_CORES))
+    return cores if cores >= 1 else DEFAULT_CUBE_CORES
+
 
 # (block_dim, stream, a, a_scale, b, b_scale, out, m, k, n)
 KERNEL_ARGS = [
@@ -102,7 +125,8 @@ def compile_kernel(
     check_shape(k, n)
     out_dir = HERE / "build"
     out_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"mxfp4_matmul_a5_k{k}_n{n}"
+    cores = cube_core_count()
+    stem = f"mxfp4_matmul_a5_k{k}_n{n}_tb{cores}"
     if extra_defs:
         tag = "_".join(sorted(d.lstrip("-D").replace("=", "") for d in extra_defs))
         stem = f"{stem}_{tag}"
@@ -115,7 +139,11 @@ def compile_kernel(
     bisheng = f"{home}/bin/bisheng"
     arch = ["--cce-aicore-arch=dav-c310", "-DREGISTER_BASE"]
     inc = [f"-I{home}/aarch64-linux/include", f"-I{home}/include"]
-    shape = [f"-DMXMM_TEST_K={k}", f"-DMXMM_TEST_N={n}"]
+    shape = [
+        f"-DMXMM_TEST_K={k}",
+        f"-DMXMM_TEST_N={n}",
+        f"-DMXMM_TARGET_BLOCKS={cores}",
+    ]
     cmd = [bisheng, "-xcce", *arch, *FIXED_FLAGS, *inc, *shape, *extra_defs]
     subprocess.run([*cmd, "-c", str(SRC), "-o", str(obj)], check=True)
     link = f"-fPIC -shared --cce-fatobj-link -Wl,-soname,{so.name}".split()
@@ -251,7 +279,7 @@ def load_matmul(so_path, k: int, n: int):
             )
         blocks = (m_run // m_tile) * (n // n_tile)
         kernel(
-            min(MAX_BLOCK_DIM, max(1, blocks)),
+            min(cube_core_count(), max(1, blocks)),
             current_stream_ptr() if stream_ptr is None else stream_ptr,
             ctypes.c_void_p(a.data_ptr()),
             ctypes.c_void_p(a_scale.data_ptr()),
@@ -285,7 +313,7 @@ def load_matmul(so_path, k: int, n: int):
         rows = int(a.shape[0]) if m is None else int(m)
         m_run, m_tile, n_tile = plan(rows)
         prepared_out = run(a, a_scale, b, b_scale, out=out, m=rows)
-        blocks = min(MAX_BLOCK_DIM, max(1, (m_run // m_tile) * (n // n_tile)))
+        blocks = min(cube_core_count(), max(1, (m_run // m_tile) * (n // n_tile)))
         stream = current_stream_ptr() if stream_ptr is None else stream_ptr
         pointers = tuple(
             ctypes.c_void_p(buf.data_ptr())
