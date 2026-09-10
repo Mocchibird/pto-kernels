@@ -1,7 +1,9 @@
 """Build and load the A5 MXFP4 matmul kernel.
 
-``y = A @ B`` with both operands MXFP4 block-32, accumulated in fp32 and stored
-bf16, on the cube's native microscaled path.
+A full ``y = A @ B`` with both operands MXFP4 -- E2M1 nibbles carrying one
+E8M0 scale per 32 elements along K -- accumulated in fp32 and stored bf16, on
+the cube's native microscaled path. The 32 is the scale granularity; the
+matmul is not blocked.
 
 K and N are compile-time template arguments, because the GM strides are
 per-layer constants and static addressing is what keeps the inner loop tight.

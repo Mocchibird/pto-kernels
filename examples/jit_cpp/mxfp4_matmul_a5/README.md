@@ -1,8 +1,14 @@
 # mxfp4_matmul_a5 — MXFP4 x MXFP4 matmul on the A5 cube
 
-`y = A @ B` with **both** operands MXFP4 block-32, accumulated in fp32 and
-stored bf16, on the Ascend 950 / A5 (`dav-c310`) cube's native microscaled
-path. JIT-compiled with `bisheng` and driven through `ctypes`.
+A full `y = A @ B` over the whole `(M, K) x (K, N)`, with **both** operands
+MXFP4 -- E2M1 nibbles carrying one E8M0 scale per 32 elements along K --
+accumulated in fp32 and stored bf16, on the Ascend 950 / A5 (`dav-c310`)
+cube's native microscaled path. JIT-compiled with `bisheng` and driven
+through `ctypes`.
+
+The 32 is MXFP4's scale granularity and nothing else: the matmul itself is
+not blocked. Do not read it as the block-32 rotation that
+`fused_hadamard_quant_b32_a5` names.
 
 ```
 A: (M, K)  E2M1 nibbles, two per byte, + one E8M0 scale per 32 along K
@@ -11,7 +17,7 @@ y: (M, N)  bf16
 ```
 
 A5 has a microscaled matmul in hardware, `TMATMUL_MX`, whose semantics are
-MXFP4 block-32 exactly. From PTO's own CPU reference (`pto/cpu/TMatmul.hpp`):
+MXFP4's exactly. From PTO's own CPU reference (`pto/cpu/TMatmul.hpp`):
 
 ```
 acc += a(i, k) * b(k, j) * aScale(i, k / 32) * bScale(k / 32, j)
