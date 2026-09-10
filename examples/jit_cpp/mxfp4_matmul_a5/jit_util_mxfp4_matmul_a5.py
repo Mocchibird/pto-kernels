@@ -44,9 +44,6 @@ KERNEL_ARGS = [
     ctypes.c_uint32,
     ctypes.c_uint32,
 ]
-# call_mxfp4_matmul_grouped and _repeat take one leading count.
-COUNTED_KERNEL_ARGS = [ctypes.c_uint32] + KERNEL_ARGS
-
 # Flags that never vary; one string so black leaves the wrapping alone.
 FIXED_FLAGS = (
     "-O2 -std=c++17 -fPIC -Wno-ignored-attributes -Wno-macro-redefined "

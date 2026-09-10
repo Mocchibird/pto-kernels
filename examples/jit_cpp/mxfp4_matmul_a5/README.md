@@ -180,15 +180,19 @@ L1 is 512 KB, and that bounds the slab. Two `K_L1=512` sets fit in 272 KB; two
 
 ```
 error: static assertion failed due to requirement
-'L1_SETS * (a_l1_bytes + b_l1_bytes + BASE_M * SK_L1 + SK_L1 * BASE_N)
- <= 512U * 1024U': L1 sets must fit the 512 KB L1
+'L1_SETS * l1_set_bytes + scale_bytes <= 512U * 1024U': the data sets plus
+the whole-K scale pair must fit the 512 KB L1; reduce L1_SETS or K
 ```
+
+`-DMXMM_K_L1=1024 -DMXMM_L1_SETS=1` does build, at the cost of the load/extract
+overlap.
 
 Tunable through `-D`, each with a `static_assert` that fires per instantiation
 so an unsupported combination cannot be built: `MXMM_BASE_M`, `MXMM_BASE_N`,
-`MXMM_K_L1`, `MXMM_L1_SETS`, `MXMM_SWIZZLE`, `MXMM_TINY_M`, and the ablation
-switches `MXMM_NO_LOAD`, `MXMM_NO_EXTRACT`, `MXMM_NO_MATMUL`, `MXMM_NO_STORE`,
-`MXMM_NO_SYNC`.
+`MXMM_K_L1`, `MXMM_L1_SETS` (1 or 2), `MXMM_SWIZZLE`, `MXMM_TINY_M`, and the
+build shape `MXMM_TEST_K` / `MXMM_TEST_N`. Every one of them produces correct
+output; the timing-only ablation switches used to attribute the bottleneck have
+been removed.
 
 ## What would close the gap
 
@@ -233,8 +237,9 @@ remaining distance is known rather than mysterious:
   from 1.87x to 1.29x even at K=N=512, which points at the tile-selection rule
   rather than at the inner loop.
 
-A third L1 set is not one of them. `MXMM_L1_SETS=3` builds to a genuinely
-different object and measures 1.005x, 0.999x and 0.989x at (M=4096, K=N=4096),
-(4096, 8192) and (1024, 2048) — 1.00x against spreads of 2–23%. Deeper
-buffering cannot help a stage bound by per-descriptor issue cost rather than by
-bandwidth.
+A third L1 set is not one of them, and is no longer in the source. It built to
+a genuinely different object and measured 1.005x, 0.999x and 0.989x at
+(M=4096, K=N=4096), (4096, 8192) and (1024, 2048) — 1.00x against spreads of
+2–23%. Deeper buffering cannot help a stage bound by per-descriptor issue cost
+rather than by bandwidth, so the set was removed and `MXMM_L1_SETS` now accepts
+1 or 2.
