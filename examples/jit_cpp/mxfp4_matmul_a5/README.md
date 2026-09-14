@@ -56,7 +56,7 @@ height off the returned tensor.
 
 `torch_npu`'s `npu_quant_matmul` reaches the same hardware path, so it is the
 arm that matters. Ratios below are **ours / vendor**, above 1 meaning this
-kernel is faster. Each figure is the median of three separate processes, each
+kernel is faster. Each figure is the median of six separate processes, each
 of which took the median of up to 100 interleaved reps.
 
 | K=N | ours / vendor | ours wins | ours peak | vendor peak | ours as % of vendor peak |
@@ -139,13 +139,18 @@ Every part of this is load-bearing on a shared box.
 * **Wall clock over a synchronised launch.** The NPU event timer has reported
   82, 28, 7.6 and 24 us for one and the same launch.
 * **A device-to-device copy reference per run**, printed and stored in the CSV.
-  It held at 1414–1427 GB/s across the three runs behind the table above, which
+  It held at 1424–1435 GB/s across the six runs behind the table above, which
   is this part's normal figure; a collapse means another tenant and the ratios
   from that run are not comparable.
-* **Three processes, not one.** The vendor op is bimodal per process — it picks
+* **Six processes, not one.** The vendor op is bimodal per process — it picks
   a kernel at process start — so a single process can settle a near-tie the
-  wrong way. Across the three, 4 of 144 shapes disagreed on the sign, all of
-  them in the 0.99–1.05 band, and the worst run-to-run disagreement was 11.7%.
+  wrong way, and it is the largest source of disagreement here by some margin.
+  Across the six, 14 of 144 shapes disagree on the sign. Eleven of those are one
+  process in which the vendor took its faster kernel at K=N=12288 and at
+  M=16, K=N=8192 — that is the bimodality itself, not noise — and the other
+  three sit at a median of 0.99–1.00 and are true near-ties. Read as two
+  independent triples, the medians agree to 1.8% per shape and 11.2% at worst,
+  and 2 of 144 cells change sign, both of them on 1.00x.
 
 Absolute microseconds and TFLOP/s here are from one box, an `Ascend950PR_9589`
 whose HBM runs at about 1.6 TB/s. Ratios between arms measured in the same run
