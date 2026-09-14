@@ -64,7 +64,7 @@ prediction and the measurement meet.
 | 8192 | 122.5 | 192.3 | **1.57x** | 1386 | 1396 |
 | 16384 | 122.5 | 189.3 | **1.55x** | 1387 | 1418 |
 
-64Mi elements per launch. The fused column is flat -- 121.5 to 122.9 us across a
+67 million elements per launch. The fused column is flat -- 121.5 to 122.9 us across a
 16x range of row width -- because the transform is entirely hidden under the DMA
 at every width. Both arms reach much the same bandwidth, the kernel 1382-1398
 GB/s against the copy's 1396-1418, so the kernel is not moving bytes faster than

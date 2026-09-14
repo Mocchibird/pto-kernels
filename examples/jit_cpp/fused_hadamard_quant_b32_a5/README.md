@@ -52,8 +52,8 @@ its 2.14x is two launches against one rather than anything about bytes. At K=102
 the unfused intermediate is `2*M*k` = 32 MB against a 128 MiB L2, so the unfused
 arm reads much of it from cache rather than HBM, which flatters the arm fusing is
 measured against; the 14.5% bracket spread on that row is the same thing showing
-up as noise. The copy section below has neither problem, since it runs 64Mi
-elements whatever `K` is.
+up as noise. The copy section below has neither problem, since it runs 67
+million elements whatever `K` is.
 
 ## It runs at about the speed of a copy of its input
 
@@ -64,7 +64,7 @@ elements whatever `K` is.
 | 4096 | 117.1 | 192.8 | **1.65x** | 1450 | 1392 |
 | 16384 | 117.3 | 192.4 | **1.64x** | 1448 | 1395 |
 
-64Mi elements per launch. Both arms reach much the same bandwidth -- the kernel
+67 million elements per launch. Both arms reach much the same bandwidth -- the kernel
 1398-1477 GB/s against the copy's 1394-1420 -- so the kernel is not moving bytes
 faster than a copy, it is moving 1.58x fewer of them: 2.53 B/element against 4.0.
 The butterfly and the quantizer are both hidden under the DMA. That

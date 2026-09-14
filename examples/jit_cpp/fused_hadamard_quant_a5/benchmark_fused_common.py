@@ -30,7 +30,7 @@ import torch_npu  # noqa
 
 from jit_util_fused_common import MX_BLOCK
 
-COPY_ELEMS = 1 << 26
+COPY_ELEMS = 1 << 26  # 67 million elements per timed launch, whatever K is
 M = 16384
 TRIALS = 15
 LAUNCHES = 20
@@ -180,7 +180,10 @@ def main(build_and_load, shapes, description=None):
             f"{r['vs_two']:>5.2f}x {r['rel']:>8.4f} {r['spread_pct']:>6.1f}%"
         )
 
-    print(f"\n=== B. fused vs a d2d copy ({COPY_ELEMS // 1024}Ki elements) ===")
+    print(
+        f"\n=== B. fused vs a d2d copy "
+        f"({COPY_ELEMS / 1e6:.0f} million elements) ==="
+    )
     print(
         f"{'K':>7} {'batch':>8} {'fused':>8} {'copy':>8} {'vs copy':>8} "
         f"{'fused GB/s':>11} {'copy GB/s':>10} {'spread':>7}"
