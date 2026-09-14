@@ -12,8 +12,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "fused_hadamard_quant_a5"))
 
-from benchmark_fused_common import main  # noqa: E402
-from jit_util_fused_b32_a5 import build_and_load  # noqa: E402
+from benchmark_fused_common import main  # noqa
+from jit_util_fused_b32_a5 import build_and_load  # noqa
 
 # K=32 is a row of 0.5M elements at M=16384, where the fused arm is on the
 # dispatch floor rather than on bytes; kept because that is worth seeing.

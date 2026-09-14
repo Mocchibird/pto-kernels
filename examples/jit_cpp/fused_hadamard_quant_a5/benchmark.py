@@ -10,8 +10,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from benchmark_fused_common import main  # noqa: E402
-from jit_util_fused_a5 import build_and_load  # noqa: E402
+from benchmark_fused_common import main  # noqa
+from jit_util_fused_a5 import build_and_load  # noqa
 
 # At M=16384 the unfused intermediates are 2*M*k bytes. Below K=4096 that fits
 # the 128 MiB L2, so the unfused arms partly read from cache and the ladder

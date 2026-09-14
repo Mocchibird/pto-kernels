@@ -17,14 +17,14 @@ _COMMON = HERE.parent / "fused_hadamard_quant_a5"
 if str(_COMMON) not in sys.path:
     sys.path.insert(0, str(_COMMON))
 
-from jit_util_fused_common import (  # noqa: E402,F401
+from jit_util_fused_common import (  # noqa
     MX_BLOCK,
     VECTOR_CORES,
     KernelSpec,
     current_stream_ptr,
 )
-from jit_util_fused_common import build_and_load as _build_and_load  # noqa: E402
-from jit_util_fused_common import compile_kernel as _compile_kernel  # noqa: E402
+from jit_util_fused_common import build_and_load as _build_and_load  # noqa
+from jit_util_fused_common import compile_kernel as _compile_kernel  # noqa
 
 SOURCE = HERE / "fused_hadamard_quant_b32_a5.cpp"
 BUILDDIR = HERE / "build"

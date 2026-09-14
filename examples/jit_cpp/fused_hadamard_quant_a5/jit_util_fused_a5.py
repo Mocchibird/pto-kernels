@@ -9,7 +9,7 @@ and for the note on the unnormalised Sylvester factor.
 import functools
 from pathlib import Path
 
-from jit_util_fused_common import (  # noqa: F401
+from jit_util_fused_common import (  # noqa
     MX_BLOCK,
     VECTOR_CORES,
     KernelSpec,
