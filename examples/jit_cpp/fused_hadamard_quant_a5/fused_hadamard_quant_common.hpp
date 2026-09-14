@@ -34,22 +34,15 @@ using namespace pto;
 // WINDOW is two registers: the deinterleave load splits a 2*lanes run into
 // even/odd halves, and the concat-halves store puts them back.
 constexpr unsigned SLOTS = 8;  // unroll width: register sets per sweep
-constexpr unsigned HAD_ALIGN = 512;
 
 constexpr unsigned MX_BLOCK = 32;  // MXFP4 block: 32 elements, one E8M0 scale
 
-// The three pipeline parameters, overridable for tuning. The defaults are the
-// tuned point: 24576 is the largest tile that fits UB at all, and 3 is the only
-// buffer count it fits at. It beats the 16384/4/2 this kernel shipped with by
-// 1.063-1.066x on large launches, bit-exact, with no regression at any shape
-// measured. Numbers and the full grid are in the README.
-//
-// Overriding is safe in the way that matters: every combination is checked by
-// the static_asserts at the end of QuantShape, so a tile that will not fit UB,
-// or a prefetch depth that would deadlock, fails to COMPILE rather than
-// misbehaving. And the host reads rows-per-tile back from the .so
-// (hadamard_mxfp4_full_rows_for), so a changed TILE_ELEMS cannot desynchronise
-// from the harness.
+// The tuned point: 24576 is the largest tile that fits UB, and 3 the only
+// buffer count it fits at. Beats the 16384/4/2 this shipped with by
+// 1.063-1.066x on large launches, bit-exact. Overriding is safe because
+// QuantShape's static_asserts reject a tile that will not fit or a prefetch
+// depth that would deadlock, and the host reads rows-per-tile back from the
+// .so, so a changed TILE_ELEMS cannot desynchronise from the harness.
 #ifndef FUSED_BUFFERS
 #define FUSED_BUFFERS 3
 #endif
@@ -60,16 +53,13 @@ constexpr unsigned MX_BLOCK = 32;  // MXFP4 block: 32 elements, one E8M0 scale
 #define FUSED_TILE_ELEMS 24576  // 48 KB bf16
 #endif
 
-// WHY vsts AND NOT vscatter. The butterfly halves go out as a vsts
-// NORM_B16 pair. A vscatter with an identity index was built and measured
-// against it -- same instruction count, same registers, same dependency
-// chain, bit-identical output, the opcode the only difference -- and it cost
-// +28.96 us per call, 111.57 against 82.61, paired 0.741x, resolved. That
-// also refuted a ROL5 index meant to absorb the rotation fixup into the store
-// for free: the fixup is 13.8% of the kernel (82.74 -> 71.31 us, paired
-// 1.164x), so the opcode swap alone costs about 2.5x what it would remove.
-// Break-even needed vscatter under ~5.5x a vsts. Both arms are gone; the
-// numbers are why the store looks the way it does.
+// WHY vsts AND NOT vscatter. A vscatter with an identity index -- same
+// instructions, registers and dependency chain, bit-identical output, only
+// the opcode differing -- cost +28.96 us per call, 111.57 against 82.61,
+// paired 0.741x. That also refuted a ROL5 index meant to absorb the rotation
+// fixup for free: the fixup is 13.8% of the kernel (82.74 -> 71.31 us, paired
+// 1.164x), so the swap costs ~2.5x what it removes. Break-even needed
+// vscatter under ~5.5x a vsts.
 //
 // It also explains the pure-PTO kernel: its two TTRANS calls are 96% of its
 // 2052 us, and the vendor builds bf16 TTRANS out of vgather2/vscatter.
@@ -171,6 +161,134 @@ struct RoundUp {
 // Byte offsets within a pipeline slot, plus shared scratch. Constexpr
 // *variables* for the reason above, so the slot base is multiplied in at
 // the use site.
+// Every derived size for one instantiation.
+template <unsigned Order, unsigned K, unsigned Rows, unsigned NBuffers,
+          unsigned NPrefetch>
+struct QuantShape {
+  static constexpr unsigned tile_elems = Rows * K;
+  static constexpr unsigned row_elems = K;
+  static constexpr unsigned rows_in_tile = Rows;
+  static constexpr unsigned blocks = tile_elems / MX_BLOCK;
+  static constexpr unsigned in_bytes = tile_elems * 2u;
+  static constexpr unsigned q_bytes = tile_elems / 2u;
+  static constexpr unsigned scale_bytes = blocks;
+
+  // One "group" is one vcgmax: 8 blocks == 256 elements.
+  static constexpr unsigned groups = blocks / VCGMAX_B16_RESULTS;
+  // Round UP: the last bite may be partial. Safe only because the buffers
+  // below are sized from these counts, and nothing reads what a partial bite
+  // writes past `blocks`. The asserts at the end of this struct pin both.
+  static constexpr unsigned compact_iters =
+      (groups + GROUPS_PER_COMPACT - 1u) / GROUPS_PER_COMPACT;
+  static constexpr unsigned b_iters = (blocks + B16_LANES - 1u) / B16_LANES;
+  static constexpr unsigned c_iters = tile_elems / (2u * B16_LANES);
+
+  // maxima_bytes carries a register of read-ahead: the gather reads one
+  // register past its last input offset. The rest are sized from what the loops
+  // WRITE, since the two rounded counts can exceed their data by one bite.
+  static constexpr unsigned maxima_bytes =
+      compact_iters * GROUPS_PER_COMPACT * GROUP_PITCH_B16 * 2u + B16_LANES;
+  static constexpr unsigned packed_bytes =
+      compact_iters * GROUPS_PER_COMPACT * VCGMAX_B16_RESULTS * 2u;
+  static constexpr unsigned aligned_in = RoundUp<in_bytes>::value;
+  static constexpr unsigned aligned_q = RoundUp<q_bytes>::value;
+  static constexpr unsigned aligned_s = RoundUp<b_iters * B16_LANES>::value;
+  static constexpr unsigned aligned_max = RoundUp<maxima_bytes>::value;
+  static constexpr unsigned aligned_packed = RoundUp<packed_bytes>::value;
+  static constexpr unsigned aligned_mult =
+      RoundUp<b_iters * B16_LANES * 2u>::value;
+
+  static constexpr unsigned slot_stride = aligned_in + aligned_q + aligned_s;
+  static constexpr unsigned scratch_base = NBuffers * slot_stride;
+  // every scratch region SlotOffset hands out, in the same order, so the two
+  // cannot drift: omitting one here silently shrinks the UB-overflow guard
+  static constexpr unsigned ub_needed =
+      scratch_base + aligned_max + aligned_packed + aligned_mult;
+
+  // Butterfly geometry, keyed on Order -- the width one rotation spans. The
+  // full-row kernel passes K, the block-32 kernel passes MX_BLOCK, and that
+  // single parameter is the whole difference between them.
+  //
+  // Sylvester factors H_Order = H_(Order/256) (x) H_256, so phase 1 runs the
+  // order-256 transform inside each 256-element window and phase 2 pairs
+  // windows elementwise for the remaining log2(Order/256) stages. Both phases
+  // are independent pieces, so neither caps the width. At Order <= 256 phase 2
+  // is empty and `rotations` undoes the packing tail instead.
+  static constexpr unsigned had_window = 2u * B16_LANES;
+  static constexpr unsigned log2_order = Log2<Order>::value;
+  static constexpr unsigned log2_window = Log2<had_window>::value;
+  static constexpr unsigned rows_per_window =
+      Order < had_window ? had_window / Order : 1u;
+  static constexpr unsigned phase1_stages =
+      log2_order < log2_window ? log2_order : log2_window;
+  static constexpr unsigned rotations = log2_window - phase1_stages;
+  static constexpr unsigned windows_per_row =
+      K < had_window ? 1u : K / had_window;
+  static constexpr unsigned phase2_stages = log2_order - phase1_stages;
+  static constexpr unsigned upper = had_window / 2u;
+  static constexpr unsigned lanes = upper < B16_LANES ? upper : B16_LANES;
+  static constexpr unsigned chunks = upper / lanes;
+  static constexpr unsigned windows_per_tile = tile_elems / had_window;
+  static constexpr unsigned groups_per_iter =
+      UnrollFor<windows_per_tile, SLOTS>::value;
+  static constexpr unsigned had_iters =
+      tile_elems / had_window / groups_per_iter;
+  static constexpr unsigned sweep_stride = groups_per_iter * had_window;
+  // Derived from groups_per_iter, NOT SLOTS: a slot addresses window
+  // `Slot / chunks` at chunk `Slot % chunks`, so a call with N slots covers
+  // N/chunks windows while the loop advances groups_per_iter per iteration.
+  // Here groups_per_iter = SLOTS / chunks makes the two agree by construction.
+  static constexpr unsigned sweep_slots = groups_per_iter * chunks;
+
+  static_assert(Order >= MX_BLOCK && !(Order & (Order - 1u)),
+                "the rotation order must be a power of two, one MXFP4 block "
+                "or wider");
+  static_assert(chunks == 1u, "a 256-wide window is exactly two registers");
+  static_assert(phase1_stages + phase2_stages == log2_order,
+                "the two phases must add up to the full transform");
+  static_assert(tile_elems % had_window == 0,
+                "tile must be a whole number of butterfly windows");
+  static_assert(windows_per_tile % groups_per_iter == 0,
+                "UnrollFor must divide the window count exactly");
+  static_assert(sweep_slots <= SLOTS,
+                "a sweep would need more register slots than SLOTS declares");
+  // The tiling condition the overlap bug violated: one iteration's slots must
+  // cover exactly the windows the stride advances, no more and no fewer.
+  static_assert(sweep_slots / chunks * had_window == sweep_stride,
+                "sweep slots and sweep_stride disagree: iterations overlap");
+
+  static_assert(Rows > 0, "no Rows makes Rows*K a whole TILE_GRAIN: bad K");
+  static_assert(K % MX_BLOCK == 0, "a block may not straddle a row boundary");
+  static_assert(TILE_GRAIN == VSTS_ALIGN * MX_BLOCK, "grain != scale DMA row");
+  static_assert(tile_elems % TILE_GRAIN == 0, "tile is not a whole grain");
+  static_assert(tile_elems % (2u * B16_LANES) == 0, "pack_nibbles wants 256");
+  static_assert(scale_bytes % VSTS_ALIGN == 0, "scale row is not a legal DMA");
+  static_assert(q_bytes % VSTS_ALIGN == 0, "nibble row is not a legal DMA");
+  static_assert(in_bytes % VSTS_ALIGN == 0, "input row is not a legal DMA");
+  static_assert(blocks % VCGMAX_B16_RESULTS == 0,
+                "blocks != whole vcgmax groups");
+  // the rounded-up passes run one bite past the data; prove they stay inside
+  static_assert(b_iters * B16_LANES <= aligned_s, "scale tail overruns");
+  static_assert(b_iters * B16_LANES * 2u <= aligned_mult,
+                "recips tail overruns");
+  static_assert(packed_bytes <= aligned_packed, "compaction tail overruns");
+  static_assert(groups * VSTS_ALIGN <= aligned_max, "padded maxima overrun");
+  static_assert(
+      c_iters * VCGMAX_B16_RESULTS <= b_iters * B16_LANES,
+      "pack_nibbles would index recips past what derive_scales wrote");
+  static_assert(sizeof(bfloat16_t) == 2, "RowsFor assumes 2-byte elements");
+  static_assert(ub_needed <= UB_BYTES, "UB overflow");
+  // Strictly less, not <=. The once-per-launch D load signals on EVENT_ID7 over
+  // MTE2 -> V, and buffer_free[7] is also EVENT_ID7 on that same pipe pair, so
+  // at NBuffers == EVENT_SLOTS buffer 7 and the D preamble would share a
+  // channel. Unreachable at the shipped NBuffers of 3; this stops it becoming
+  // reachable.
+  static_assert(NBuffers < EVENT_SLOTS,
+                "NBUF must leave EVENT_ID7 free for the D preamble");
+  static_assert(NPrefetch < NBuffers,
+                "PREFETCH == NBUF deadlocks the pipeline");
+};
+
 template <typename Shape>
 struct SlotOffset {
   static constexpr unsigned input = 0;
@@ -197,6 +315,86 @@ using UbTilePart =
          SLayout::NoneBox, TileConfig::fractalABSize, PadValue::Zero>;
 
 using HadRegs = vector_u16[SLOTS];
+
+// --- the rotation ------------------------------------------------------------
+// One sweep: deinterleave-load a window, add/sub, and store the halves back
+// concatenated. Registers are vector_u16 because vlds/vsts are bit-width ops;
+// the arithmetic type is chosen by reference cast, which is how bf16 costs
+// nothing here. All loads precede all stores, which the comma fold guarantees
+// by evaluating left to right -- required, not stylistic, since a store would
+// otherwise clobber a window a later load still needs.
+
+template <typename Shape, unsigned Rotations, std::size_t... Slot>
+inline AICORE void sweep(__ubuf__ uint16_t *tile, uint32_t base, MaskReg all,
+                         HadRegs &even, HadRegs &odd, HadRegs &sum,
+                         HadRegs &diff, std::index_sequence<Slot...>) {
+  constexpr unsigned g = Shape::had_window, up = Shape::upper;
+  constexpr unsigned ln = Shape::lanes, ch = Shape::chunks;
+  (vlds(even[Slot], odd[Slot],
+        tile + base + Slot / ch * g + Slot % ch * 2u * ln, 0, DINTLV_B16),
+   ...);
+  (vadd((vector_bf16 &)sum[Slot], (vector_bf16 &)even[Slot],
+        (vector_bf16 &)odd[Slot], all),
+   ...);
+  (vsub((vector_bf16 &)diff[Slot], (vector_bf16 &)even[Slot],
+        (vector_bf16 &)odd[Slot], all),
+   ...);
+  // A 256-element window packs eight independent 32-blocks, which leaves the
+  // result rotated right by log2(window/block) = 3; these register-only
+  // deinterleaves undo it, fused into the final stage using the pair that is
+  // dead by then. vdintlv costs about 20x a vadd and there are Rotations of
+  // them per slot against five arithmetic ops, which makes this fixup 13.8%
+  // of the kernel -- measured, see the store note at the top of the file.
+  if constexpr (Rotations >= 1) {
+    (vdintlv(even[Slot], odd[Slot], sum[Slot], diff[Slot]), ...);
+  }
+  if constexpr (Rotations >= 2) {
+    (vdintlv(sum[Slot], diff[Slot], even[Slot], odd[Slot]), ...);
+  }
+  if constexpr (Rotations >= 3) {
+    (vdintlv(even[Slot], odd[Slot], sum[Slot], diff[Slot]), ...);
+  }
+  HadRegs &lo = (Rotations % 2 == 1) ? even : sum;
+  HadRegs &hi = (Rotations % 2 == 1) ? odd : diff;
+  (vsts(lo[Slot], tile + base + Slot / ch * g + Slot % ch * ln, 0, NORM_B16,
+        all),
+   ...);
+  (vsts(hi[Slot], tile + base + Slot / ch * g + up + Slot % ch * ln, 0,
+        NORM_B16, all),
+   ...);
+}
+
+// log2(K) stages over the tile already in UB, in place. The quant passes read
+// the same buffer straight afterwards, which is the point of the fusion.
+template <typename Shape>
+__tf__ static AICORE void rotate(__ubuf__ uint16_t *tile) {
+  // sweep_slots, not SLOTS: see the derivation in Shape. The register arrays
+  // are sized SLOTS and a shorter pack leaves the top ones unused.
+  constexpr auto slots = std::make_index_sequence<Shape::sweep_slots>{};
+  constexpr unsigned plain =
+      Shape::phase1_stages - (Shape::rotations ? 1u : 0u);
+  __VEC_SCOPE__ {
+    uint32_t lane_count = Shape::lanes;
+    MaskReg all = CreatePredicate<bfloat16_t>(lane_count);
+    vector_u16 even[SLOTS], odd[SLOTS], sum[SLOTS], diff[SLOTS];
+    // Step by a literal 1 with the stride folded into base: the loop analyser
+    // only verifies a tripcount for a literal step, and 1 divides any bound, so
+    // had_iters may be template-dependent.
+    for (uint16_t stage = 0; stage < (uint16_t)plain; ++stage) {
+      for (uint16_t iter = 0; iter < (uint16_t)Shape::had_iters; ++iter)
+        sweep<Shape, 0>(tile, (uint32_t)iter * Shape::sweep_stride, all, even,
+                        odd, sum, diff, slots);
+      mem_bar(VST_VLD);
+    }
+    if constexpr (Shape::rotations > 0) {
+      for (uint16_t iter = 0; iter < (uint16_t)Shape::had_iters; ++iter)
+        sweep<Shape, Shape::rotations>(tile,
+                                       (uint32_t)iter * Shape::sweep_stride,
+                                       all, even, odd, sum, diff, slots);
+      mem_bar(VST_VLD);
+    }
+  }
+}
 
 // ------------------------------------------------------- block_abs_max
 // Per-32-element magnitude max. A 2:1 fold makes 16 lanes == one block,
