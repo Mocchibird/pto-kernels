@@ -22,6 +22,7 @@ import ctypes
 import functools
 import os
 import subprocess
+import warnings
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -45,15 +46,36 @@ def cube_core_count() -> int:
     core, and the tile picker uses the same number to decide when a shape
     fills the machine. Cached, because a property query per launch is the
     per-call cost ``current_stream_ptr`` warns about.
+
+    A device that will not answer falls back to ``DEFAULT_CUBE_CORES``, which
+    is right for the A5 this was written on but is a guess anywhere else, and
+    a wrong guess is silent: too low leaves cores idle, too high oversubscribes
+    them. The fallback warns for that reason -- the launch is still correct
+    either way, only slower.
     """
     import torch
 
     try:
         properties = torch.npu.get_device_properties(torch.npu.current_device())
-    except (AttributeError, RuntimeError):
+    except (AttributeError, RuntimeError) as exc:
+        warnings.warn(
+            f"could not read cube_core_num from the device ({exc!r}); "
+            f"assuming {DEFAULT_CUBE_CORES} cube cores. The result is still "
+            f"correct, but block_dim may not match this part.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return DEFAULT_CUBE_CORES
     cores = int(getattr(properties, "cube_core_num", DEFAULT_CUBE_CORES))
-    return cores if cores >= 1 else DEFAULT_CUBE_CORES
+    if cores < 1:
+        warnings.warn(
+            f"device reported cube_core_num={cores}; assuming "
+            f"{DEFAULT_CUBE_CORES} cube cores instead.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return DEFAULT_CUBE_CORES
+    return cores
 
 
 # (block_dim, stream, a, a_scale, b, b_scale, out, m, k, n)
