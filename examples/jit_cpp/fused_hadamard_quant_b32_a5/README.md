@@ -22,8 +22,9 @@ window is 256 = eight blocks, and a block never straddles a row. The MXFP4
 group is also 32, so one scale covers exactly one rotated block.
 
 That frees the rotation, not the tile. A width must still give `RowsFor` a row
-count whose `Rows * K` is a whole 1024-element grain, which 76 of the 512
-multiples of 32 up to 16384 do; the 28 above are the instantiated ones. A width
+count whose `Rows * K` is a whole 1024-element grain, which at the default
+`FUSED_TILE_ELEMS` 76 of the 512 multiples of 32 up to 16384 do; the 28 above
+are the instantiated ones. A width
 that does not -- 11008, for instance -- fails a `static_assert` at compile time
 rather than misbehaving at run time.
 

@@ -23,8 +23,9 @@
 // to be a power of two, so 4096, 5120 and 14336 are all instantiable.
 //
 // It does NOT make every multiple of 32 legal. The tile still has to divide
-// into whole grains, which is what RowsFor solves; 76 of the 512 multiples of
-// 32 up to 16384 admit a row count, and SUPPORTED_K instantiates 28 of them.
+// into whole grains, which is what RowsFor solves; at the default TILE_ELEMS
+// 76 of the 512 multiples of 32 up to 16384 admit a row count, and SUPPORTED_K
+// instantiates 28 of them.
 // A width that does not (11008, say) fails the Rows > 0 static_assert at
 // compile time rather than misbehaving.
 //

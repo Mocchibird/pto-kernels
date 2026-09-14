@@ -12,6 +12,11 @@
 // The tunables (FUSED_TILE_ELEMS, FUSED_BUFFERS, FUSED_PREFETCH) and the two
 // ladder switches (FUSED_ROTATE_ONLY, FUSED_NO_ROTATE) apply to both kernels
 // and are documented in either README.
+//
+// The `static` on the moved __tf__ functions came with them from the .cpp and
+// is not doing anything a template does not already do -- each example is its
+// own .so, so there is one instantiation either way. It is left alone because
+// removing it would change the generated code for no stated reason.
 #ifndef PTO_EXAMPLES_FUSED_HADAMARD_QUANT_COMMON_HPP
 #define PTO_EXAMPLES_FUSED_HADAMARD_QUANT_COMMON_HPP
 

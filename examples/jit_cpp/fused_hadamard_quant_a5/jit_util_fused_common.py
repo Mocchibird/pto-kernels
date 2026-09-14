@@ -30,6 +30,10 @@ import torch_npu  # noqa
 MX_BLOCK = 32
 VECTOR_CORES = 64  # vector cores on an A5
 
+# The C++ both kernels share. It is a build input like the .cpp, so the .so
+# cache has to watch it too; see KernelSpec.newest_input.
+COMMON_HEADER = Path(__file__).resolve().parent / "fused_hadamard_quant_common.hpp"
+
 
 @dataclass(frozen=True)
 class KernelSpec:
@@ -50,6 +54,17 @@ class KernelSpec:
     @property
     def build_dir(self) -> Path:
         return self.source.parent / "build"
+
+    @property
+    def newest_input(self) -> float:
+        """mtime of the newest thing the .so is built from.
+
+        The .cpp is no longer the only input: most of the kernel moved into
+        COMMON_HEADER, and a cache keyed on the .cpp alone would serve a stale
+        .so after an edit to the header -- silently, which is the one failure
+        this cache must not have.
+        """
+        return max(self.source.stat().st_mtime, COMMON_HEADER.stat().st_mtime)
 
 
 def _flags(home):
@@ -82,7 +97,7 @@ def compile_kernel(spec, verbose=True, extra_defs=()):
     # tile instructions and a rebuild can outlast the task queue's 600 s cap, so
     # recompiling per call is not merely wasteful.
     cached = build_dir / f"{spec.lib_stem}{tag}.so"
-    if cached.exists() and cached.stat().st_mtime > spec.source.stat().st_mtime:
+    if cached.exists() and cached.stat().st_mtime > spec.newest_input:
         if verbose:
             print("reusing", cached)
         return cached
