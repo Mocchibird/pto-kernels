@@ -1,6 +1,6 @@
-// Block-32 Hadamard fused with MXFP4 quantization, one launch.
+// Full-row Hadamard fused with MXFP4 quantization, one launch.
 //
-//   x  ->  (x @ H) -> E2M1 nibbles + one E8M0 scale per 32
+//   x  ->  (x @ H_K) -> E2M1 nibbles + one E8M0 scale per 32
 //
 // Unfused this is two passes over HBM: read x / write rotated, then read
 // rotated / write nibbles+scales. Fused it is read x / write nibbles+scales, so
@@ -16,19 +16,18 @@
 // NORM_B16), so only the arithmetic type changes, by reference cast. That is
 // the same idiom mxfp4_quant_a5 already uses for its max reduction.
 //
-// The difference from v1 is not just a pinned width. v1 rotates a whole row, so
-// K must be a power of two and at most 2048. Here the Hadamard is always 32
-// wide and a row is a sequence of independent 32-blocks, which decouples the
-// rotation from the row width: K goes back to any multiple of 32, so 4096 and
-// 11008 work, which a row-wide rotation rejects.
+// The rotation is order K -- the whole row -- so K must be a power of two.
+// Sylvester factors as H_K = H_(K/256) (x) H_256, so a row is rotated as
+// K/256 register-local windows (phase 1) and then the cross-window stages
+// that finish the transform (phase 2). Neither phase holds more than one
+// 256-element window in registers, so the width is not capped by register
+// pressure: SUPPORTED_K runs from 32 to 16384.
 //
-// It falls out of the tile being a flat run of Rows*K elements. Blocks are
-// contiguous and 32 long, the butterfly window is 256 = eight blocks, and
-// blocks are independent -- so one window covers eight of them and never has to
-// care whether they came from the same row.
-//
-// Also: the MXFP4 group is 32 and the Hadamard block is 32, so a scale covers
-// exactly one rotated block. No reshaping, and no group straddling a rotation.
+// fused_hadamard_quant_b32_a5 is the companion that rotates in independent
+// 32-blocks instead. Pick that one when K is not a power of two, or when the
+// widest rotation is not wanted -- there a scale covers exactly one rotated
+// block, whereas a row-wide rotation spreads an outlier over every block's
+// shared scale.
 #include <pto/pto-inst.hpp>
 #include <type_traits>
 #include <utility>
@@ -69,32 +68,19 @@ constexpr unsigned MX_BLOCK = 32;  // MXFP4 block: 32 elements, one E8M0 scale
 #define FUSED_TILE_ELEMS 24576  // 48 KB bf16
 #endif
 
-// Store the butterfly halves with vscatter instead of vsts.
+// WHY vsts AND NOT vscatter. The butterfly halves go out as a vsts
+// NORM_B16 pair. A vscatter with an identity index was built and measured
+// against it -- same instruction count, same registers, same dependency
+// chain, bit-identical output, the opcode the only difference -- and it cost
+// +28.96 us per call, 111.57 against 82.61, paired 0.741x, resolved. That
+// also refuted a ROL5 index meant to absorb the rotation fixup into the store
+// for free: the fixup is 13.8% of the kernel (82.74 -> 71.31 us, paired
+// 1.164x), so the opcode swap alone costs about 2.5x what it would remove.
+// Break-even needed vscatter under ~5.5x a vsts. Both arms are gone; the
+// numbers are why the store looks the way it does.
 //
-//   0  vsts NORM_B16 pair -- what ships, and the default.
-//   1  vscatter with an IDENTITY index. Same instruction count, same registers,
-//      same dependency chain, bit-identical output; the ONLY difference is the
-//      opcode. This exists to price vscatter against vsts, because vscatter's
-//      cost on A5 is not documented and the vendor's bf16 TTRANS is built from
-//      it -- and two TTRANS calls are 96% of the pure-PTO kernel's cost, so it
-//      could be far dearer than a plain store.
-//
-// Mode 2 was a ROL5 index meant to absorb the rotation fixup into the store at
-// no extra instruction -- the fixup is 13.8% of the kernel (82.74 -> 71.31 us
-// with -DFUSED_NO_ROTFIX, paired 1.164x, resolved). It is GONE, refuted by
-// mode 1: vscatter costs +28.96 us per call against vsts (111.57 against 82.61,
-// paired 0.741x, resolved), so the opcode swap alone costs 2.5x what the fixup
-// it would remove is worth. Break-even needed vscatter under ~5.5x a vsts.
-//
-// This also explains the pure-PTO kernel: its two TTRANS calls are 96% of its
+// It also explains the pure-PTO kernel: its two TTRANS calls are 96% of its
 // 2052 us, and the vendor builds bf16 TTRANS out of vgather2/vscatter.
-
-#ifndef FUSED_SCATTER
-#define FUSED_SCATTER 0
-#endif
-#if FUSED_SCATTER > 1
-#error "FUSED_SCATTER=2 (ROL5 store) was measured and refuted; see above"
-#endif
 
 constexpr unsigned DEF_BUFFERS = FUSED_BUFFERS;    // UB pipeline buffers
 constexpr unsigned DEF_PREFETCH = FUSED_PREFETCH;  // tiles in flight ahead
@@ -128,10 +114,6 @@ struct RowsFor {
   static constexpr unsigned step = TILE_GRAIN / Gcd<K, TILE_GRAIN>::value;
   static constexpr unsigned value = (cap / step) * step;
 };
-
-#if defined(FUSED_ROTATE_ONLY) && defined(MXFP4_TQUANT)
-#error "FUSED_ROTATE_ONLY does nothing in a TQuant build: TQuant owns them"
-#endif
 
 #ifdef __CCE_AICORE__
 constexpr unsigned B16_LANES = 128;  // bf16 lanes in one vector register
@@ -232,24 +214,6 @@ struct QuantShape {
   // cannot drift: omitting one here silently shrinks the UB-overflow guard
   static constexpr unsigned ub_needed =
       scratch_base + aligned_max + aligned_packed + aligned_mult;
-
-#ifdef MXFP4_TQUANT
-  // TQuant reads its per-block maxima a whole register at a time, so the span
-  // rounds up to b_iters registers, and its reducer flushes one 32-byte block
-  // past the last group.
-  static constexpr unsigned tquant_max_elems = b_iters * B16_LANES;
-  static constexpr unsigned tquant_max_bytes =
-      tquant_max_elems * 2u + VSTS_ALIGN;
-  static constexpr unsigned tquant_scaling_bytes = blocks * 2u;
-  static_assert(tquant_max_bytes <= aligned_max,
-                "TQuant maxima do not fit the maxima region");
-  static_assert(tquant_scaling_bytes <= aligned_mult,
-                "TQuant scaling does not fit the reciprocal region");
-  // numGroups truncates inside TQuant, and a partial 8-group window takes a
-  // different store path.
-  static_assert(tile_elems % MX_BLOCK == 0, "TQuant would drop a group");
-  static_assert(blocks % 8u == 0, "TQuant would take its vstus tail path");
-#endif
 
   // --- butterfly geometry, in two phases
   // ------------------------------ The rotation is order K, and Sylvester
@@ -395,8 +359,7 @@ using HadRegs = vector_u16[SLOTS];
 template <typename Shape, unsigned Rotations, std::size_t... Slot>
 inline AICORE void sweep(__ubuf__ uint16_t *tile, uint32_t base, MaskReg all,
                          HadRegs &even, HadRegs &odd, HadRegs &sum,
-                         HadRegs &diff, vector_u16 &idx_lo, vector_u16 &idx_hi,
-                         std::index_sequence<Slot...>) {
+                         HadRegs &diff, std::index_sequence<Slot...>) {
   constexpr unsigned g = Shape::had_group, up = Shape::upper;
   constexpr unsigned ln = Shape::lanes, ch = Shape::chunks;
   (vlds(even[Slot], odd[Slot],
@@ -411,16 +374,9 @@ inline AICORE void sweep(__ubuf__ uint16_t *tile, uint32_t base, MaskReg all,
   // A 256-element window packs eight independent 32-blocks, which leaves the
   // result rotated right by log2(window/block) = 3; these register-only
   // deinterleaves undo it, fused into the final stage using the pair that is
-  // dead by then.
-  //
-  // ATTRIBUTION SWITCH. vdintlv was measured at ~20x a vadd, and there are
-  // Rotations per slot here against five arithmetic ops, so this fixup may be
-  // most of the butterfly's cost. -DFUSED_NO_ROTFIX drops the deinterleaves and
-  // keeps everything else, including both stores, so the difference is the
-  // fixup. It PRODUCES WRONG OUTPUT -- the registers selected below then hold
-  // loaded values rather than rotated ones -- so it is for timing only and the
-  // benchmark's correctness gate will reject it.
-#ifndef FUSED_NO_ROTFIX
+  // dead by then. vdintlv costs about 20x a vadd and there are Rotations of
+  // them per slot against five arithmetic ops, which makes this fixup 13.8%
+  // of the kernel -- measured, see the store note at the top of the file.
   if constexpr (Rotations >= 1) {
     (vdintlv(even[Slot], odd[Slot], sum[Slot], diff[Slot]), ...);
   }
@@ -430,25 +386,14 @@ inline AICORE void sweep(__ubuf__ uint16_t *tile, uint32_t base, MaskReg all,
   if constexpr (Rotations >= 3) {
     (vdintlv(even[Slot], odd[Slot], sum[Slot], diff[Slot]), ...);
   }
-#endif
   HadRegs &lo = (Rotations % 2 == 1) ? even : sum;
   HadRegs &hi = (Rotations % 2 == 1) ? odd : diff;
-#if FUSED_SCATTER == 0
   (vsts(lo[Slot], tile + base + Slot / ch * g + Slot % ch * ln, 0, NORM_B16,
         all),
    ...);
   (vsts(hi[Slot], tile + base + Slot / ch * g + up + Slot % ch * ln, 0,
         NORM_B16, all),
    ...);
-#else
-  // vscatter instead of vsts, one for one. The index decides which experiment
-  // this is; see the FUSED_SCATTER comment at the top of the file. Both halves
-  // address the SAME window base, because with a permuting index the upper half
-  // is no longer a contiguous run at +upper.
-  (vscatter(lo[Slot], tile + base + Slot / ch * g, idx_lo, all), ...);
-  (vscatter(hi[Slot], tile + base + Slot / ch * g, idx_hi, all), ...);
-  (void)up;
-#endif
 }
 
 // --- phase 2: the cross-window stages ---------------------------------------
@@ -603,32 +548,20 @@ __tf__ static AICORE void rotate(__ubuf__ uint16_t *tile) {
     uint32_t lane_count = Shape::lanes;
     MaskReg all = CreatePredicate<bfloat16_t>(lane_count);
     vector_u16 even[SLOTS], odd[SLOTS], sum[SLOTS], diff[SLOTS];
-    // Scatter indices, built once per tile and unused when FUSED_SCATTER == 0.
-    // There is no vands, so the low three bits of the lane come out as
-    // l - (l >> 3) * 8. vshrs/vmuls/vadds are vector-scalar; vadd/vsub are
-    // vector-vector.
-    vector_u16 idx_lo, idx_hi;
-    vci((vector_s16 &)idx_lo, (int16_t)0, INC_ORDER);
-#if FUSED_SCATTER == 1
-    // IDENTITY index: byte-for-byte what the vsts pair does, so the output must
-    // be bit-identical and the only difference measured is the opcode price.
-    vdup(idx_hi, (uint16_t)Shape::upper, all, MODE_ZEROING);
-    vadd(idx_hi, idx_lo, idx_hi, all);
-#endif
     // Step by a literal 1 with the stride folded into base: the loop analyser
     // only verifies a tripcount for a literal step, and 1 divides any bound, so
     // had_iters may be template-dependent.
     for (uint16_t stage = 0; stage < (uint16_t)plain; ++stage) {
       for (uint16_t iter = 0; iter < (uint16_t)Shape::had_iters; ++iter)
         sweep<Shape, 0>(tile, (uint32_t)iter * Shape::sweep_stride, all, even,
-                        odd, sum, diff, idx_lo, idx_hi, slots);
+                        odd, sum, diff, slots);
       mem_bar(VST_VLD);
     }
     if constexpr (Shape::rotations > 0) {
       for (uint16_t iter = 0; iter < (uint16_t)Shape::had_iters; ++iter)
-        sweep<Shape, Shape::rotations>(
-            tile, (uint32_t)iter * Shape::sweep_stride, all, even, odd, sum,
-            diff, idx_lo, idx_hi, slots);
+        sweep<Shape, Shape::rotations>(tile,
+                                       (uint32_t)iter * Shape::sweep_stride,
+                                       all, even, odd, sum, diff, slots);
       mem_bar(VST_VLD);
     }
   }
@@ -771,55 +704,6 @@ __tf__ static AICORE void pack_nibbles(__ubuf__ uint16_t *input,
   }
 }
 
-#ifdef MXFP4_TQUANT
-// Requires PTO 9.1.0: 9.0.0 has no MXFP4 quantizer. Included here, not at file
-// scope, because this region is inside the device-pass guard.
-#include <pto/npu/a5/TQuant.hpp>
-
-// ------------------------------------------------------- tquant_passes
-// One vendor tile op in place of block_abs_max, compact_maxima, derive_scales
-// and pack_nibbles. validCols is tile_elems even on the partial tile: the load
-// already zero-fills the pad, and a short validCols would send TQuant's own
-// ZeroPadSourceTile over the input slot. Offsets::packed is left allocated and
-// unused, since reclaiming it would move slot_stride.
-template <typename Shape>
-inline AICORE void tquant_passes(uint32_t input_offset, uint32_t nibble_offset,
-                                 uint32_t scale_offset) {
-  static_assert(sizeof(float4_e2m1x2_t) == 1,
-                "the nibble tile assumes one byte per float4_e2m1x2_t");
-  static_assert(REPEAT_BYTE / sizeof(bfloat16_t) == B16_LANES,
-                "tquant_max_elems assumes a 128-lane b16 vector");
-  UbTile<bfloat16_t, Shape::tile_elems> source;
-  UbTile<float4_e2m1x2_t, Shape::q_bytes> nibbles;
-  UbTile<uint8_t, Shape::scale_bytes> scales;
-  UbTile<bfloat16_t, Shape::tquant_max_elems> block_max;
-  UbTile<bfloat16_t, Shape::blocks> reciprocal;
-  TASSIGN(source, input_offset);
-  TASSIGN(nibbles, nibble_offset);
-  TASSIGN(scales, scale_offset);
-  TASSIGN(block_max, SlotOffset<Shape>::maxima);
-  TASSIGN(reciprocal, SlotOffset<Shape>::reciprocal);
-  // TEMPLATE order is Out, Src, Exp, Max, Scaling; ARGUMENT order is dst, exp,
-  // max, scaling, src. PTO 9.1.0 release inserted a `bool Exp2DStrided` second
-  // template parameter that 9.1.0-beta.3 does not have; the tile types are in a
-  // non-deduced position, so neither spelling can be dropped. benchmark.py
-  // compiles both and keeps whichever the local headers accept.
-#ifdef MXFP4_TQUANT_EXP2D
-  TQuant_MXFP4_E2M1_Impl<QuantScaleAlg::OCP, false, decltype(nibbles),
-                         decltype(source), decltype(scales),
-                         decltype(block_max), decltype(reciprocal)>(
-      nibbles.data(), scales.data(), block_max.data(), reciprocal.data(),
-      source.data(), 1u, Shape::tile_elems);
-#else
-  TQuant_MXFP4_E2M1_Impl<QuantScaleAlg::OCP, decltype(nibbles),
-                         decltype(source), decltype(scales),
-                         decltype(block_max), decltype(reciprocal)>(
-      nibbles.data(), scales.data(), block_max.data(), reciprocal.data(),
-      source.data(), 1u, Shape::tile_elems);
-#endif
-}
-#endif  // MXFP4_TQUANT
-
 // Move one tile of `T` between GM and UB. Partial carries only `valid`
 // elements: the load zero-fills the rest of the UB tile so the compute passes
 // still see whole registers, and the store truncates so padding never reaches
@@ -868,7 +752,7 @@ inline AICORE void issue_tile_load(uint32_t nth_tile, uint32_t core_id,
 // loads in flight so DMA and the vector pipe overlap.
 #if defined(__CCE_AICORE__) && defined(__DAV_VEC__)
 // A device function rather than the kernel body, so a caller that wants the
-// pipeline over a sub-range can reach it directly. mxfp4_quant below is the
+// pipeline over a sub-range can reach it directly. The kernel below is the
 // entry point and the only caller here.
 template <unsigned K, unsigned Rows, unsigned NBuffers, unsigned NPrefetch>
 inline AICORE void quant_tiles(__gm__ void *input_gm, __gm__ void *nibble_gm,
@@ -902,11 +786,6 @@ inline AICORE void quant_tiles(__gm__ void *input_gm, __gm__ void *nibble_gm,
                                      input_gm);
     wait_flag(PIPE_MTE2, PIPE_V, buffer_free[buffer]);
     const uint32_t slot_base = buffer * Shape::slot_stride;
-#ifdef MXFP4_TQUANT
-    tquant_passes<Shape>(slot_base + Offsets::input,
-                         slot_base + Offsets::nibbles,
-                         slot_base + Offsets::scales);
-#else
     // name the UB regions once; inline casts are noise at every call site
     using B16 = __ubuf__ uint16_t *;
     B16 input_ub = (B16)(uintptr_t)(slot_base + Offsets::input);
@@ -923,16 +802,9 @@ inline AICORE void quant_tiles(__gm__ void *input_gm, __gm__ void *nibble_gm,
     // phase 2 finishes the transform when a row is wider than one window. A
     // separate call because __tf__ may not call __tf__, and a separate
     // __VEC_SCOPE__ because it needs its own register set.
-    //
-    // ATTRIBUTION SWITCH. -DFUSED_NO_CROSS drops phase 2 and keeps phase 1 and
-    // the quantizer, so the difference is what the cross-window stages cost.
-    // It PRODUCES WRONG OUTPUT for K > 256 -- the transform is unfinished -- so
-    // it is for timing only and every correctness gate will reject it.
-#ifndef FUSED_NO_CROSS
     if constexpr (Shape::phase2_stages > 0) {
       cross_windows<Shape>(input_ub);
     }
-#endif
 #else
     // Diagnostic build: same kernel, same tiling, same UB layout and buffer
     // count -- only the butterfly removed. Comparing this against the quantizer
@@ -959,7 +831,6 @@ inline AICORE void quant_tiles(__gm__ void *input_gm, __gm__ void *nibble_gm,
     (void)packed_ub;
     (void)recips_ub;
     (void)nibble_ub;
-#endif
 #endif
     set_flag(PIPE_V, PIPE_MTE3, buffer_free[buffer]);
     wait_flag(PIPE_V, PIPE_MTE3, buffer_free[buffer]);
@@ -997,9 +868,10 @@ inline AICORE void quant_tiles(__gm__ void *input_gm, __gm__ void *nibble_gm,
 #endif  // __CCE_AICORE__ && __DAV_VEC__
 
 template <unsigned K, unsigned Rows, unsigned NBuffers, unsigned NPrefetch>
-__global__ AICORE void mxfp4_quant(__gm__ void *input_gm,
-                                   __gm__ void *nibble_gm,
-                                   __gm__ void *scale_gm, uint32_t batch) {
+__global__ AICORE void fused_hadamard_mxfp4_full(__gm__ void *input_gm,
+                                                 __gm__ void *nibble_gm,
+                                                 __gm__ void *scale_gm,
+                                                 uint32_t batch) {
 #ifdef __DAV_VEC__
   quant_tiles<K, Rows, NBuffers, NPrefetch>(input_gm, nibble_gm, scale_gm,
                                             batch);
@@ -1019,8 +891,9 @@ inline void launch_for_k(uint32_t block_dim, void *stream, uint8_t *input,
                          uint8_t *nibbles, uint8_t *scales, uint32_t batch,
                          uint32_t k, std::index_sequence<Idx...>) {
   ((k == SUPPORTED_K[Idx]
-        ? (void)(mxfp4_quant<SUPPORTED_K[Idx], RowsFor<SUPPORTED_K[Idx]>::value,
-                             DEF_BUFFERS, DEF_PREFETCH>
+        ? (void)(fused_hadamard_mxfp4_full<SUPPORTED_K[Idx],
+                                           RowsFor<SUPPORTED_K[Idx]>::value,
+                                           DEF_BUFFERS, DEF_PREFETCH>
                  <<<block_dim, nullptr, stream>>>(input, nibbles, scales,
                                                   batch))
         : (void)0),
