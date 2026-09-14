@@ -61,7 +61,7 @@ def compile_kernel(verbose=True, extra_defs=()):
         if verbose:
             print("reusing", cached)
         return cached
-    obj = BUILDDIR / f"fused_b32{tag}.o"
+    obj = BUILDDIR / f"fused_full{tag}.o"
     lib = cached
     for step in (
         [

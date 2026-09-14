@@ -2,9 +2,9 @@
 
 `x -> order-K Hadamard -> E2M1 nibbles + one E8M0 scale per 32`, as a
 single kernel on the Ascend 950 / A5 (`dav-c310-vec`) vector core, JIT-compiled
-with `bisheng` and loaded through `ctypes`. `K` is a template parameter over 26
-widths; one `.so` holds an instantiation per width and the launcher dispatches on
-it, so there is no rebuild per size.
+with `bisheng` and loaded through `ctypes`. `K` is a template parameter over the
+10 powers of two from 32 to 16384; one `.so` holds an instantiation per width and
+the launcher dispatches on it, so there is no rebuild per size.
 
 `fused_hadamard_quant_b32_a5` is the companion that rotates independent
 32-element blocks instead. Prefer that one for a `K` that is not a power of two;
@@ -124,7 +124,8 @@ python3 -m pytest -q test_fused_hadamard_quant_a5.py
 ./run_benchmark.sh              # or: python3 benchmark.py --device 0
 ```
 
-Needs a CANN whose PTO carries MXFP4 (`Exp2DStrided` in `pto/npu/a5/TQuant.hpp`).
+Needs a CANN whose PTO carries MXFP4: the kernel packs through
+`vector_f4e2m1x2`, declared in `pto/npu/a5/datatype.hpp`.
 9.1.0 and 9.2.0 both do; 9.0.0 does not.
 
 ## Tunables

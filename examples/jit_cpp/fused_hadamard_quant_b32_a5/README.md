@@ -16,10 +16,16 @@ quantization error than a full-row rotation at K=4096, because spreading an
 outlier across the whole row lifts every block's shared scale instead of just
 one block's.
 
-The rotation is 32 wide rather than row wide, which is what lets `K` be any
-multiple of 32 instead of a power of two: a row is a run of independent 32-blocks,
-the butterfly window is 256 = eight blocks, and a block never straddles a row.
-The MXFP4 group is also 32, so one scale covers exactly one rotated block.
+The rotation is 32 wide rather than row wide, which is what frees `K` from
+being a power of two: a row is a run of independent 32-blocks, the butterfly
+window is 256 = eight blocks, and a block never straddles a row. The MXFP4
+group is also 32, so one scale covers exactly one rotated block.
+
+That frees the rotation, not the tile. A width must still give `RowsFor` a row
+count whose `Rows * K` is a whole 1024-element grain, which 76 of the 512
+multiples of 32 up to 16384 do; the 28 above are the instantiated ones. A width
+that does not -- 11008, for instance -- fails a `static_assert` at compile time
+rather than misbehaving at run time.
 
 ## Fusing the pair is 2.45-2.54x the two separate launches
 
@@ -111,7 +117,8 @@ python3 -m pytest -q test_fused_hadamard_quant_b32_a5.py
 ./run_benchmark.sh              # or: python3 benchmark.py --device 0
 ```
 
-Needs a CANN whose PTO carries MXFP4 (`Exp2DStrided` in `pto/npu/a5/TQuant.hpp`).
+Needs a CANN whose PTO carries MXFP4: the kernel packs through
+`vector_f4e2m1x2`, declared in `pto/npu/a5/datatype.hpp`.
 9.1.0 and 9.2.0 both do; 9.0.0 does not.
 
 ## Tunables
