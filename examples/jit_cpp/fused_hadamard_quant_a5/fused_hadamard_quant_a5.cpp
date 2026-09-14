@@ -2,32 +2,17 @@
 //
 //   x  ->  (x @ H_K) -> E2M1 nibbles + one E8M0 scale per 32
 //
-// Unfused this is two passes over HBM: read x / write rotated, then read
-// rotated / write nibbles+scales. Fused it is read x / write nibbles+scales, so
-// on a DMA-bound op the saving is close to the whole second pass.
-//
-// Built from two kernels that are already measured and merged upstream:
-// fast_hadamard_a5 supplies the butterfly, mxfp4_quant_a5 the four quant
-// passes, the tiling and the outputs. Both are left doing what they already do;
-// what is new here is that the rotated tile never leaves UB.
-//
-// The butterfly was fp16 upstream and is bf16 here, which costs nothing
-// structurally: vlds/vsts are bit-width ops on vector_u16 (DINTLV_B16 /
-// NORM_B16), so only the arithmetic type changes, by reference cast. That is
-// the same idiom mxfp4_quant_a5 already uses for its max reduction.
-//
 // The rotation is order K -- the whole row -- so K must be a power of two.
-// Sylvester factors as H_K = H_(K/256) (x) H_256, so a row is rotated as
-// K/256 register-local windows (phase 1) and then the cross-window stages
-// that finish the transform (phase 2). Neither phase holds more than one
-// 256-element window in registers, so the width is not capped by register
-// pressure: SUPPORTED_K runs from 32 to 16384.
+// Sylvester factors as H_K = H_(K/256) (x) H_256, so a row is rotated as K/256
+// register-local windows (phase 1) and then the cross-window stages that
+// finish the transform (phase 2). Neither phase holds more than one
+// 256-element window in registers, so width is not capped by register
+// pressure: SUPPORTED_K runs 32 to 16384.
 //
-// fused_hadamard_quant_b32_a5 is the companion that rotates in independent
-// 32-blocks instead. Pick that one when K is not a power of two, or when the
-// widest rotation is not wanted -- there a scale covers exactly one rotated
-// block, whereas a row-wide rotation spreads an outlier over every block's
-// shared scale.
+// fused_hadamard_quant_b32_a5 next to it rotates independent 32-blocks
+// instead; there a scale covers exactly one rotated block, where a row-wide
+// rotation spreads an outlier over every block's shared scale. See the README
+// and fused_hadamard_quant_common.hpp for what the two have in common.
 #include "fused_hadamard_quant_common.hpp"
 
 // Row widths with an instantiation. The full set the quantizer supports: a
@@ -117,16 +102,10 @@ struct QuantShape {
   static constexpr unsigned had_iters =
       tile_elems / had_group / groups_per_iter;
   static constexpr unsigned sweep_stride = groups_per_iter * had_group;
-  // How many register slots one sweep call must use. This has to be derived
-  // from groups_per_iter, NOT from SLOTS.
-  //
-  // A slot addresses window `Slot / chunks` at chunk `Slot % chunks`, so a call
-  // with N slots covers N/chunks windows, while the loop advances
-  // groups_per_iter windows per iteration. Instantiating the sweep with SLOTS
-  // when groups_per_iter is smaller makes consecutive iterations overlap and
-  // runs the last one off the end of the tile.
-  //
-  // groups_per_iter = SLOTS / chunks makes these agree by construction.
+  // Derived from groups_per_iter, NOT SLOTS: a slot addresses window
+  // `Slot / chunks` at chunk `Slot % chunks`, so a call with N slots covers
+  // N/chunks windows while the loop advances groups_per_iter per iteration.
+  // Here groups_per_iter = SLOTS / chunks makes the two agree by construction.
   static constexpr unsigned sweep_slots = groups_per_iter * chunks;
 
   static_assert(K >= MX_BLOCK && !(K & (K - 1u)),

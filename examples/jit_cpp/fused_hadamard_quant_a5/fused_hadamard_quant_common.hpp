@@ -1,21 +1,27 @@
-// Everything the two fused Hadamard + MXFP4 quantize examples have in common:
-// the UB and DMA constants, the shape arithmetic, the four quantizer passes and
-// the tile pipeline. What is NOT here is the butterfly -- sweep, rotate and the
-// QuantShape geometry that drives them -- because that is the whole difference
-// between the two kernels, one rotating a whole row and the other independent
-// 32-element blocks.
+// Shared by the two fused Hadamard + MXFP4 quantize kernels in this
+// directory: the UB and DMA constants, the shape arithmetic, the four
+// quantizer passes and the tile pipeline. Not the butterfly -- sweep, rotate
+// and the QuantShape geometry that drives them are the whole difference
+// between the two, so each kernel keeps its own.
 //
-// Included by both kernels in this directory. Each defines its own
-// SUPPORTED_K, QuantShape, butterfly and entry points.
+// Unfused the pair is two passes over HBM: read x / write rotated, then read
+// rotated / write nibbles+scales. Fused it is read x / write nibbles+scales,
+// so on a DMA-bound op the saving is close to the whole second pass.
 //
-// The tunables (FUSED_TILE_ELEMS, FUSED_BUFFERS, FUSED_PREFETCH) and the two
-// ladder switches (FUSED_ROTATE_ONLY, FUSED_NO_ROTATE) apply to both kernels
-// and are documented in either README.
+// Built from two kernels already measured and merged upstream:
+// fast_hadamard_a5 supplies the butterfly, mxfp4_quant_a5 the four quant
+// passes, the tiling and the outputs. What is new is that the rotated tile
+// never leaves UB. The butterfly was fp16 upstream and is bf16 here, which
+// costs nothing structurally: vlds/vsts are bit-width ops on vector_u16
+// (DINTLV_B16 / NORM_B16), so only the arithmetic type changes, by reference
+// cast -- the idiom mxfp4_quant_a5 already uses for its max reduction.
 //
 // The `static` on the moved __tf__ functions came with them from the .cpp and
-// is not doing anything a template does not already do -- each example is its
-// own .so, so there is one instantiation either way. It is left alone because
-// removing it would change the generated code for no stated reason.
+// does nothing a template does not: each kernel is its own .so, so there is
+// one instantiation either way.
+//
+// The tunables and the two ladder switches apply to both kernels and are
+// documented in the README.
 #ifndef PTO_EXAMPLES_FUSED_HADAMARD_QUANT_COMMON_HPP
 #define PTO_EXAMPLES_FUSED_HADAMARD_QUANT_COMMON_HPP
 

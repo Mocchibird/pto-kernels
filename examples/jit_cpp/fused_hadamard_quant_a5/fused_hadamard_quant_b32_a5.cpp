@@ -1,41 +1,24 @@
 // Block-32 Hadamard fused with MXFP4 quantization, one launch.
 //
-//   x  ->  (x @ H) -> E2M1 nibbles + one E8M0 scale per 32
+//   x  ->  (x @ H_32 per block) -> E2M1 nibbles + one E8M0 scale per 32
 //
-// Unfused this is two passes over HBM: read x / write rotated, then read
-// rotated / write nibbles+scales. Fused it is read x / write nibbles+scales, so
-// on a DMA-bound op the saving is close to the whole second pass.
+// The Hadamard is always 32 wide and a row is a sequence of independent
+// 32-blocks, which decouples the rotation from the row width: K need not be a
+// power of two, so 4096, 5120 and 14336 are all instantiable. It falls out of
+// the tile being a flat run of Rows*K elements -- blocks are contiguous and 32
+// long, the butterfly window is 256 = eight blocks, and blocks are
+// independent, so one window covers eight of them without caring whether they
+// came from the same row. The MXFP4 group is also 32, so a scale covers
+// exactly one rotated block: no reshaping, no group straddling a rotation.
 //
-// Built from two kernels that are already measured and merged upstream:
-// fast_hadamard_a5 supplies the butterfly, mxfp4_quant_a5 the four quant
-// passes, the tiling and the outputs. Both are left doing what they already do;
-// what is new here is that the rotated tile never leaves UB.
+// It does NOT make every multiple of 32 legal. The tile must still divide into
+// whole grains, which is what RowsFor solves: at the default TILE_ELEMS, 76 of
+// the 512 multiples of 32 up to 16384 admit a row count and SUPPORTED_K
+// instantiates 28. A width that does not (11008, say) fails the Rows > 0
+// static_assert at compile time rather than misbehaving.
 //
-// The butterfly was fp16 upstream and is bf16 here, which costs nothing
-// structurally: vlds/vsts are bit-width ops on vector_u16 (DINTLV_B16 /
-// NORM_B16), so only the arithmetic type changes, by reference cast. That is
-// the same idiom mxfp4_quant_a5 already uses for its max reduction.
-//
-// The difference from the companion fused_hadamard_quant_a5 is not just a
-// pinned width. That one rotates a whole row, so K must be a power of two.
-// Here the Hadamard is always 32 wide and a row is a sequence of independent
-// 32-blocks, which decouples the rotation from the row width: K no longer has
-// to be a power of two, so 4096, 5120 and 14336 are all instantiable.
-//
-// It does NOT make every multiple of 32 legal. The tile still has to divide
-// into whole grains, which is what RowsFor solves; at the default TILE_ELEMS
-// 76 of the 512 multiples of 32 up to 16384 admit a row count, and SUPPORTED_K
-// instantiates 28 of them.
-// A width that does not (11008, say) fails the Rows > 0 static_assert at
-// compile time rather than misbehaving.
-//
-// It falls out of the tile being a flat run of Rows*K elements. Blocks are
-// contiguous and 32 long, the butterfly window is 256 = eight blocks, and
-// blocks are independent -- so one window covers eight of them and never has to
-// care whether they came from the same row.
-//
-// Also: the MXFP4 group is 32 and the Hadamard block is 32, so a scale covers
-// exactly one rotated block. No reshaping, and no group straddling a rotation.
+// fused_hadamard_quant_a5 next to it rotates the whole row instead. See the
+// README and fused_hadamard_quant_common.hpp for what the two have in common.
 #include "fused_hadamard_quant_common.hpp"
 
 // Row widths with an instantiation. A 32-wide rotation puts no power-of-two
@@ -113,20 +96,14 @@ struct QuantShape {
   static constexpr unsigned had_iters =
       tile_elems / had_group / groups_per_iter;
   static constexpr unsigned sweep_stride = groups_per_iter * had_group;
-  // How many register slots one sweep call must use. This has to be derived
-  // from groups_per_iter, NOT from SLOTS.
-  //
-  // A slot addresses window `Slot / chunks` at chunk `Slot % chunks`, so a call
-  // with N slots covers N/chunks windows, while the loop advances
-  // groups_per_iter windows per iteration. Instantiating the sweep with SLOTS
-  // when groups_per_iter is smaller makes consecutive iterations overlap and
-  // runs the last one off the end of the tile.
-  //
-  // The row-wide variant cannot hit this because it defines
-  // groups_per_iter = SLOTS / chunks, which makes the two agree by
-  // construction. This kernel picks groups_per_iter with UnrollFor instead --
-  // deliberately, because a 32-wide rotation's window count need not be a
-  // multiple of 8 -- and that is exactly what decoupled them.
+  // Derived from groups_per_iter, NOT SLOTS: a slot addresses window
+  // `Slot / chunks` at chunk `Slot % chunks`, so a call with N slots covers
+  // N/chunks windows while the loop advances groups_per_iter per iteration.
+  // Instantiating with SLOTS when groups_per_iter is smaller overlaps
+  // consecutive iterations and runs the last off the end of the tile. The
+  // row-wide variant cannot hit that -- it sets groups_per_iter = SLOTS /
+  // chunks -- but this one picks it with UnrollFor, because a 32-wide
+  // rotation's window count need not be a multiple of 8.
   static constexpr unsigned sweep_slots = groups_per_iter * chunks;
 
   static_assert(HAD_BLOCK == MX_BLOCK,
