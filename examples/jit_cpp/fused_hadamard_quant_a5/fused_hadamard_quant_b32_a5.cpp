@@ -36,7 +36,7 @@
 //
 // Also: the MXFP4 group is 32 and the Hadamard block is 32, so a scale covers
 // exactly one rotated block. No reshaping, and no group straddling a rotation.
-#include "../fused_hadamard_quant_a5/fused_hadamard_quant_common.hpp"
+#include "fused_hadamard_quant_common.hpp"
 
 // Row widths with an instantiation. A 32-wide rotation puts no power-of-two
 // constraint on the row, so 4096- and 14336-style widths are in. A new width

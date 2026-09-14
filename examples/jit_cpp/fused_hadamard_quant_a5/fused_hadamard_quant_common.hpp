@@ -5,8 +5,7 @@
 // between the two kernels, one rotating a whole row and the other independent
 // 32-element blocks.
 //
-// Included by fused_hadamard_quant_a5.cpp and, from the directory next door,
-// by fused_hadamard_quant_b32_a5.cpp. Each of those defines its own
+// Included by both kernels in this directory. Each defines its own
 // SUPPORTED_K, QuantShape, butterfly and entry points.
 //
 // The tunables (FUSED_TILE_ELEMS, FUSED_BUFFERS, FUSED_PREFETCH) and the two
