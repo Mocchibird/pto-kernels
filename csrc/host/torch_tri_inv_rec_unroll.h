@@ -34,6 +34,17 @@ namespace pto_isa_ops {
  *
  * Note: supports fp16 and bf16 input dtypes. Output is fp16 or fp32.
  *
+ * Input range: the algorithm forms the powers A^(2^j) of each strictly
+ * triangular input block and holds them in the input dtype, so the input has
+ * to be scaled such that those powers stay representable. They grow fastest
+ * for dense, same-sign matrices. At the default doubling block, entries of 1.0
+ * -- the all-ones matrix the tests use -- peak at 3.4e3, 19x inside fp16,
+ * while entries of 1.5 already overflow. A matrix whose entries decay away
+ * from the diagonal, as a gated linear-attention chunk does, instead stays
+ * near its own largest entry. Input outside the range comes back as NaN rather
+ * than as a large error. See TRI_INV_DOUBLING_BLOCK in
+ * kernel_tri_inv_rec_unroll.cpp, which trades this headroom for speed.
+ *
  * @param M Input tensor containing square matrices on the last two dimensions.
  * @param cu_seqlens A 1-dimensional torch tensor that contains the lengths
  * of each input sequence (it is the cummulative sum of the lengths)
