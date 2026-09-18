@@ -152,7 +152,7 @@ def _make_inputs(T: int):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("seq_len", [128, 256, 384, 512])
+@pytest.mark.parametrize("seq_len", [128, 200, 256, 356, 384, 512])
 def test_kda_kkt_fixed(npu_device, seq_len: int):
     T = seq_len
     k, g_cs, beta = _make_inputs(T)
@@ -181,6 +181,9 @@ def test_kda_kkt_fixed(npu_device, seq_len: int):
         [256, 128],
         [128, 128, 128],
         [256, 128, 384],
+        # Tails that do not fill a chunk.
+        [200, 120],
+        [100, 356, 77],
     ],
 )
 def test_kda_kkt_varlen(npu_device, seqlens: list):

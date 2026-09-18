@@ -184,7 +184,7 @@ def stats_ok(actual: torch.Tensor, expected: torch.Tensor) -> bool:
     return ratio <= MAX_RMSE_RATIO and np.isfinite(r2) and r2 >= MIN_R2
 
 
-@pytest.mark.parametrize("seq_len", [128, 256, 384, 512])
+@pytest.mark.parametrize("seq_len", [128, 200, 256, 356, 384, 512])
 def test_kda_chunk_o_fixed(npu_device, seq_len: int):
     torch.manual_seed(42)
     T = seq_len
@@ -245,6 +245,9 @@ def test_kda_chunk_o_fixed(npu_device, seq_len: int):
         [256, 128, 384],
         [384, 128],
         [128, 256, 256],
+        # Tails that do not fill a chunk.
+        [200, 120],
+        [100, 356, 77],
     ],
 )
 def test_kda_chunk_o_varlen(npu_device, seqlens: list):
