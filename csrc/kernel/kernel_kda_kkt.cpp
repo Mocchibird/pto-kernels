@@ -272,36 +272,48 @@ AICORE inline void kda_kkt_kernel(__gm__ half* k_ptr, __gm__ float* g_cs_ptr,
 
     // ── Column loop ──────────────────────────────────────────────────
     for (int32_t c = 0; c < col_end; ++c) {
-      // Load column c's g_cs (fp32) and k (fp16 -> fp32) — [1, K].
-      const int64_t col_off = hbase + (bos + chunk_start + c) * KDim;
-      {
-        GmShapeDyn gs;
-        gs.shape[3] = 1;
-        gs.shape[4] = KDim;
-        GmFloatK gc_gm(g_cs_ptr + col_off, gs);
-        UbND<float, 1, KTC, 1, KTC> gc_ld;
-        TASSIGN(gc_ld, GC_ADDR);
-        TLOAD(gc_ld, gc_gm);
-        GmHalfK kc_gm(k_ptr + col_off, gs);
-        UbND<half, 1, KTC, 1, KTC> kc_ld;
-        TASSIGN(kc_ld, KCH_ADDR);
-        TLOAD(kc_ld, kc_gm);
-      }
-      set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-      wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-      {
-        UbND<half, 1, KTC, 1, KTC> kc_h;
-        TASSIGN(kc_h, KCH_ADDR);
-        UbND<float, 1, KTC, 1, KTC> kc_f;
-        TASSIGN(kc_f, KC_ADDR);
-        TCVT(kc_f, kc_h, pto::RoundMode::CAST_NONE);
-        PipeBarrierVec();
+      // Column c's g_cs and k.  Columns in [my_off, my_off + my_rows) are my
+      // own rows, whose g_cs (myg) and fp32 k (myk) are already in UB, so
+      // point at row c - my_off instead of re-reading GM and re-casting.
+      // The lower row half never leaves that range, and the upper half only
+      // does for its first my_off columns.
+      int32_t gc_addr = GC_ADDR;
+      int32_t kc_addr = KC_ADDR;
+      if (c >= my_off && c - my_off < my_rows) {
+        const int32_t r = c - my_off;
+        gc_addr = MYG_ADDR + r * KTC * 4;
+        kc_addr = MYK_ADDR + r * KTC * 4;
+      } else {
+        const int64_t col_off = hbase + (bos + chunk_start + c) * KDim;
+        {
+          GmShapeDyn gs;
+          gs.shape[3] = 1;
+          gs.shape[4] = KDim;
+          GmFloatK gc_gm(g_cs_ptr + col_off, gs);
+          UbND<float, 1, KTC, 1, KTC> gc_ld;
+          TASSIGN(gc_ld, GC_ADDR);
+          TLOAD(gc_ld, gc_gm);
+          GmHalfK kc_gm(k_ptr + col_off, gs);
+          UbND<half, 1, KTC, 1, KTC> kc_ld;
+          TASSIGN(kc_ld, KCH_ADDR);
+          TLOAD(kc_ld, kc_gm);
+        }
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        {
+          UbND<half, 1, KTC, 1, KTC> kc_h;
+          TASSIGN(kc_h, KCH_ADDR);
+          UbND<float, 1, KTC, 1, KTC> kc_f;
+          TASSIGN(kc_f, KC_ADDR);
+          TCVT(kc_f, kc_h, pto::RoundMode::CAST_NONE);
+          PipeBarrierVec();
+        }
       }
 
       UbND<float, 1, KTC, 1, KTC> gc;
-      TASSIGN(gc, GC_ADDR);
+      TASSIGN(gc, gc_addr);
       UbND<float, 1, KTC, 1, KTC> kc;
-      TASSIGN(kc, KC_ADDR);
+      TASSIGN(kc, kc_addr);
       UbND<float, HalfChunk, KTC, DYNAMIC, DYNAMIC> diff(my_rows, KDim);
       TASSIGN(diff, DIFF_ADDR);
       UbND<float, HalfChunk, KTC, DYNAMIC, DYNAMIC> tmp(my_rows, KDim);
