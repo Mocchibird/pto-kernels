@@ -258,8 +258,7 @@ AICORE inline void kda_kkt_kernel(__gm__ half* k_ptr, __gm__ float* g_cs_ptr,
     const int32_t col_end = rows_cap < col_cap ? rows_cap : col_cap;
     if (col_begin >= col_end) continue;  // block is entirely above the diagonal
 
-    const int64_t hbase =
-        static_cast<int64_t>(head_idx) * total_tokens * KDim;
+    const int64_t hbase = static_cast<int64_t>(head_idx) * total_tokens * KDim;
     const int64_t my_first =
         bos + chunk_start + my_off;  // global row index of my row 0
 
@@ -279,8 +278,8 @@ AICORE inline void kda_kkt_kernel(__gm__ half* k_ptr, __gm__ float* g_cs_ptr,
       tensor.shape[3] = my_rows;
       tensor.shape[4] = KDim;
       GmHalfK k_gm(k_ptr + hbase + my_first * KDim, tensor);
-      UbND<half, HalfChunk, KTC, DYNAMIC, DYNAMIC, PadValue::Zero> k_ld(
-          my_rows, KDim);
+      UbND<half, HalfChunk, KTC, DYNAMIC, DYNAMIC, PadValue::Zero> k_ld(my_rows,
+                                                                        KDim);
       TASSIGN(k_ld, MYKH_ADDR);
       TLOAD(k_ld, k_gm);
     }

@@ -298,8 +298,7 @@ AICORE void kda_chunk_o_kernel(__gm__ half* Q_handle, __gm__ half* K_handle,
       GmTensor2D<float> v_global(workspace_handle + ws_base + WS_V, v_shape,
                                  v_stride);
       DynMatL1<float, C, V_DIM> v_l1_load(C, V_DIM);
-      TASSIGN(v_l1_load,
-              (C * K_DIM + C * K_DIM + KV + C * C) * sizeof(float));
+      TASSIGN(v_l1_load, (C * K_DIM + C * K_DIM + KV + C * C) * sizeof(float));
       TLOAD(v_l1_load, v_global);
     }
     {
@@ -322,8 +321,8 @@ AICORE void kda_chunk_o_kernel(__gm__ half* Q_handle, __gm__ half* K_handle,
     {
       GmShape2D qs_shape(C, V_DIM);
       GmStride2D qs_stride(V_DIM);
-      GmTensor2D<float> qs_global(workspace_handle + ws_base + WS_QS,
-                                  qs_shape, qs_stride);
+      GmTensor2D<float> qs_global(workspace_handle + ws_base + WS_QS, qs_shape,
+                                  qs_stride);
       TileAcc<float, C, V_DIM, C, V_DIM> qs_store;
       TASSIGN(qs_store, C * C * sizeof(float));
       TSTORE(qs_global, qs_store);
@@ -333,8 +332,8 @@ AICORE void kda_chunk_o_kernel(__gm__ half* Q_handle, __gm__ half* K_handle,
     wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
 
     // GEMM3: QKV = Aqk_masked @ V_corr  [C, C] @ [C, V] → [C, V].
-    gemm_oneshot<float, float, C, V_DIM, C, /*transpose_B=*/false>(
-        qkm_l1, v_l1, qkv_l0);
+    gemm_oneshot<float, float, C, V_DIM, C, /*transpose_B=*/false>(qkm_l1, v_l1,
+                                                                   qkv_l0);
 
     {
       GmShape2D qkv_shape(C, V_DIM);
@@ -397,9 +396,8 @@ AICORE void kda_chunk_o_kernel(__gm__ half* Q_handle, __gm__ half* K_handle,
     // ====================================================================
     // PHASE A — load Q, K, G_cs; pre-scale q_eff/k_eff; write V_corr, S.
     // ====================================================================
-    int64_t hk_base =
-        static_cast<int64_t>(head) * total_tokens * K_DIM +
-        (chunk_start + static_cast<int64_t>(vid) * HalfC) * K_DIM;
+    int64_t hk_base = static_cast<int64_t>(head) * total_tokens * K_DIM +
+                      (chunk_start + static_cast<int64_t>(vid) * HalfC) * K_DIM;
 
     TileUbDataND<float, HalfC, K_DIM, HalfC, K_DIM, pto::PadValue::Zero> g_ub;
     TASSIGN(g_ub, SLOT_A_ADDR);
@@ -443,8 +441,8 @@ AICORE void kda_chunk_o_kernel(__gm__ half* Q_handle, __gm__ half* K_handle,
         TileUbDataND<float, HalfC, K_DIM, HalfC, K_DIM, pto::PadValue::Zero>
             g_stg_full;
         TASSIGN(g_stg_full, SLOT_A_ADDR);
-        DynVecTile<float, HalfC, K_DIM, pto::PadValue::Zero> g_load(
-            valid_rows, K_DIM);
+        DynVecTile<float, HalfC, K_DIM, pto::PadValue::Zero> g_load(valid_rows,
+                                                                    K_DIM);
         TASSIGN(g_load, SLOT_A_ADDR);
         TLOAD(g_load, g_global);
         if (valid_rows != HalfC) {
@@ -494,10 +492,9 @@ AICORE void kda_chunk_o_kernel(__gm__ half* Q_handle, __gm__ half* K_handle,
     {
       GmShape2D q_shape(HalfC, K_DIM);
       GmStride2D q_stride(K_DIM);
-      GmTensor2D<float> q_global(
-          workspace_handle + ws_base + WS_Q +
-              static_cast<int64_t>(vid) * HalfC * K_DIM,
-          q_shape, q_stride);
+      GmTensor2D<float> q_global(workspace_handle + ws_base + WS_Q +
+                                     static_cast<int64_t>(vid) * HalfC * K_DIM,
+                                 q_shape, q_stride);
       DynVecTile<float, HalfC, K_DIM> q_store(HalfC, K_DIM);
       TASSIGN(q_store, SLOT_C_ADDR);
       TSTORE(q_global, q_store);
@@ -521,10 +518,9 @@ AICORE void kda_chunk_o_kernel(__gm__ half* Q_handle, __gm__ half* K_handle,
         wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         GmShape2D z_shape(HalfC, C);
         GmStride2D z_stride(C);
-        GmTensor2D<float> z_global(
-            workspace_handle + ws_base + WS_QK +
-                static_cast<int64_t>(my_row_offset) * C,
-            z_shape, z_stride);
+        GmTensor2D<float> z_global(workspace_handle + ws_base + WS_QK +
+                                       static_cast<int64_t>(my_row_offset) * C,
+                                   z_shape, z_stride);
         DynVecTile<float, HalfC, C> z_store(HalfC, C);
         TASSIGN(z_store, SLOT_C_ADDR);
         TSTORE(z_global, z_store);
@@ -640,10 +636,10 @@ AICORE void kda_chunk_o_kernel(__gm__ half* Q_handle, __gm__ half* K_handle,
         {
           GmShape2D qs2(HalfC, 1);
           GmStride2D qst2(C);
-          GmTensor2D<float> qk_col(
-              workspace_handle + ws_base + WS_QK +
-                  static_cast<int64_t>(my_row_offset) * C + c,
-              qs2, qst2);
+          GmTensor2D<float> qk_col(workspace_handle + ws_base + WS_QK +
+                                       static_cast<int64_t>(my_row_offset) * C +
+                                       c,
+                                   qs2, qst2);
           TileUbDataND<float, HalfC, 16, HalfC, 1> col_st;
           TASSIGN(col_st, AQK_COL);
           TSTORE(qk_col, col_st);
@@ -660,8 +656,7 @@ AICORE void kda_chunk_o_kernel(__gm__ half* Q_handle, __gm__ half* K_handle,
     set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
     wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
     {
-      TileUbDataND<half, HalfC, V_DIM, HalfC, V_DIM, pto::PadValue::Zero>
-          vh_ub;
+      TileUbDataND<half, HalfC, V_DIM, HalfC, V_DIM, pto::PadValue::Zero> vh_ub;
       TASSIGN(vh_ub, SLOT_D_ADDR);
       TileUbDataND<float, HalfC, V_DIM, HalfC, V_DIM> v_f_ub;
       TASSIGN(v_f_ub, SLOT_A_ADDR);
@@ -692,10 +687,9 @@ AICORE void kda_chunk_o_kernel(__gm__ half* Q_handle, __gm__ half* K_handle,
       wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
       GmShape2D vw_shape(HalfC, V_DIM);
       GmStride2D vw_stride(V_DIM);
-      GmTensor2D<float> vw_global(
-          workspace_handle + ws_base + WS_V +
-              static_cast<int64_t>(vid) * HalfC * V_DIM,
-          vw_shape, vw_stride);
+      GmTensor2D<float> vw_global(workspace_handle + ws_base + WS_V +
+                                      static_cast<int64_t>(vid) * HalfC * V_DIM,
+                                  vw_shape, vw_stride);
       DynVecTile<float, HalfC, V_DIM> v_store(HalfC, V_DIM);
       TASSIGN(v_store, SLOT_A_ADDR);
       TSTORE(vw_global, v_store);
@@ -712,10 +706,9 @@ AICORE void kda_chunk_o_kernel(__gm__ half* Q_handle, __gm__ half* K_handle,
       TileUbDataND<float, HalfC, V_DIM, HalfC, V_DIM> s_f_ub;
       TASSIGN(s_f_ub, SLOT_A_ADDR);
 
-      int64_t s_in_offset =
-          (chunk_offset + static_cast<int64_t>(ci)) * H * KV +
-          static_cast<int64_t>(head) * KV +
-          static_cast<int64_t>(vid) * HalfC * V_DIM;
+      int64_t s_in_offset = (chunk_offset + static_cast<int64_t>(ci)) * H * KV +
+                            static_cast<int64_t>(head) * KV +
+                            static_cast<int64_t>(vid) * HalfC * V_DIM;
       GmShape2D s_shape(HalfC, V_DIM);
       GmStride2D s_stride(V_DIM);
       GmTensor2D<half> s_global(S_handle + s_in_offset, s_shape, s_stride);
@@ -731,10 +724,9 @@ AICORE void kda_chunk_o_kernel(__gm__ half* Q_handle, __gm__ half* K_handle,
       wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
       GmShape2D sw_shape(HalfC, V_DIM);
       GmStride2D sw_stride(V_DIM);
-      GmTensor2D<float> sw_global(
-          workspace_handle + ws_base + WS_S +
-              static_cast<int64_t>(vid) * HalfC * V_DIM,
-          sw_shape, sw_stride);
+      GmTensor2D<float> sw_global(workspace_handle + ws_base + WS_S +
+                                      static_cast<int64_t>(vid) * HalfC * V_DIM,
+                                  sw_shape, sw_stride);
       DynVecTile<float, HalfC, V_DIM> s_store(HalfC, V_DIM);
       TASSIGN(s_store, SLOT_A_ADDR);
       TSTORE(sw_global, s_store);
