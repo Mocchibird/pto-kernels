@@ -160,6 +160,10 @@ AICORE inline void kda_kkt_kernel(__gm__ half* k_ptr, __gm__ float* g_cs_ptr,
       BETA_ADDR + HalfChunk * 4;  // [1, HalfChunk] fp16 (beta staging)
   constexpr int32_t MSKC_ADDR =
       BETAH_ADDR + HalfChunk * 2;  // [1, HalfChunk] fp32 (mask col)
+  // k scaled by beta, built once per chunk.  myk itself has to stay
+  // unscaled because the column loop reads its rows as column vectors.
+  constexpr int32_t MYKB_ADDR =
+      MSKC_ADDR + HalfChunk * 4;  // [HalfChunk, K] fp32 (k * beta)
 
   for (int64_t pid = static_cast<int64_t>(lane); pid < total_work;
        pid += static_cast<int64_t>(num_lanes)) {
@@ -269,6 +273,13 @@ AICORE inline void kda_kkt_kernel(__gm__ half* k_ptr, __gm__ float* g_cs_ptr,
     TASSIGN(myk, MYK_ADDR);
     UbDN<float, HalfChunk, 1, DYNAMIC, DYNAMIC> beta_col(my_rows, 1);
     TASSIGN(beta_col, BETA_ADDR);
+    // beta[r] multiplies every term of row r's sum, so fold it into k once
+    // per chunk instead of scaling the [HalfChunk, KDim] product tile on
+    // every one of the up-to-128 columns.
+    UbND<float, HalfChunk, KTC, DYNAMIC, DYNAMIC> mykb(my_rows, KDim);
+    TASSIGN(mykb, MYKB_ADDR);
+    TROWEXPANDMUL(mykb, myk, beta_col);
+    PipeBarrierVec();
 
     // ── Column loop ──────────────────────────────────────────────────
     for (int32_t c = 0; c < col_end; ++c) {
@@ -336,10 +347,7 @@ AICORE inline void kda_kkt_kernel(__gm__ half* k_ptr, __gm__ float* g_cs_ptr,
       // *= k[c,d]  (per-dim broadcast), then *= k[my r, d]
       TCOLEXPANDMUL(diff, diff, kc);
       PipeBarrierVec();
-      TMUL(diff, diff, myk);
-      PipeBarrierVec();
-      // per-row beta scale (TMUL can't take a [R,1] column directly)
-      TROWEXPANDMUL(diff, diff, beta_col);
+      TMUL(diff, diff, mykb);
       PipeBarrierVec();
       // colsum[r] = beta[r] * sum_d diff[r,d]   (unmasked)
       TROWSUM(colsum, diff, tmp);
