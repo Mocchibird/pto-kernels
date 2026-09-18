@@ -540,8 +540,11 @@ AICORE void kda_chunk_o_kernel(__gm__ half* Q_handle, __gm__ half* K_handle,
 
         TCOLEXPANDSUB(diff, g_ub, gc);
         PipeBarrierVec();
-        TMINS(diff, diff, 0.0f);
-        PipeBarrierVec();
+        // No clamp before the exp.  g_cs is monotone decreasing within a
+        // chunk, so g_cs[r] - g_cs[c] is positive only for r < c -- the
+        // rows above the diagonal, which the inclusive-mask step below
+        // overwrites with zero.  TROWSUM keeps rows independent, so an inf
+        // or NaN there cannot reach WS_QK or contaminate a kept row.
         TEXP(diff, diff);
         PipeBarrierVec();
         TCOLEXPANDMUL(diff, diff, kc);
