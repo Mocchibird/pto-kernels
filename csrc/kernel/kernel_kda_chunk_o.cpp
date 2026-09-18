@@ -550,18 +550,20 @@ AICORE void kda_chunk_o_kernel(__gm__ half* Q_handle, __gm__ half* K_handle,
         PipeBarrierVec();
         TROWSUM(colsum, diff, tmp);
         PipeBarrierVec();
-        {
-          TileUbDataND<float, HalfC, 16, HalfC, 1> mk;
-          TASSIGN(mk, AQK_MSK);
-          GmShape2D ms(HalfC, 1);
-          GmStride2D mst(C);
-          GmTensor2D<float> mk_gm(
-              Mask_handle + static_cast<int64_t>(my_row_offset) * C + c, ms,
-              mst);
-          TLOAD(mk, mk_gm);
-          set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-          wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-          TMUL(colsum, colsum, mk);
+        // Inclusive lower-tri mask: row my_row_offset + r is kept for
+        // column c exactly when my_row_offset + r >= c, so the mask is a
+        // step.  Zero the leading c - my_row_offset rows of colsum rather
+        // than gathering a strided [HalfC, 1] strip out of GM, waiting on
+        // an MTE2->V flag pair and multiplying by it.  The upper row half
+        // skips it entirely while c <= my_row_offset.
+        const int32_t zero_rows_raw = c - my_row_offset;
+        const int32_t zero_rows =
+            zero_rows_raw < 0 ? 0
+                              : (zero_rows_raw > HalfC ? HalfC : zero_rows_raw);
+        if (zero_rows > 0) {
+          DynVecTile<float, HalfC, 16> mk0(zero_rows, 1);
+          TASSIGN(mk0, AQK_COL);
+          TEXPANDS(mk0, 0.0f);
           PipeBarrierVec();
         }
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
