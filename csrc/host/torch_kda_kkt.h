@@ -79,10 +79,11 @@ at::Tensor run_kda_kkt(const at::Tensor& K, const at::Tensor& G_cs,
   // any lane left without an item.
   const uint32_t block_dim = GetNumVectorCores();
 
-  // Strict-lower-triangular mask [C, C] float32 — used by the kernel to zero
-  // the upper-triangular entries of each chunk's L matrix.
-  const at::Tensor mask =
-      at::tril(at::ones({CHUNK_C, CHUNK_C}, G_cs.options()), /*diagonal=*/-1);
+  // The kernel derives the strict-lower mask as a computed step and never
+  // reads mask_ptr, which stays in the signature only for ABI stability.
+  // Building a [C, C] tril here cost an at::ones and an at::tril launch on
+  // every call for a buffer nobody loads.
+  const at::Tensor mask = at::empty({0}, G_cs.options());
 
   // Output L [total_tokens, H, C] fp16, BSND layout.
   // Zero-initialised: the kernel only writes strict-lower-tri entries.

@@ -14,23 +14,27 @@
 //   This kernel instead computes exp(g_cs[r]-g_cs[c]) as a DIFFERENCE, never
 //   the product of two separate exponentials.  For the kept (lower-tri) entries
 //   r>c, g_cs[r] <= g_cs[c] (g_cs monotone decreasing within a chunk) so the
-//   argument is <= 0 and exp(.) <= 1 — always finite.  We clamp the argument
-//   with min(., 0) so the masked (upper-tri) entries also stay finite (then
-//   discarded by only storing the strict-lower part).  No pivot, no saturation,
-//   exact.
+//   argument is <= 0 and exp(.) <= 1 — always finite.  The upper-tri entries
+//   are never stored and TROWSUM keeps rows independent, so they need no
+//   clamp to stay out of a kept row.  No pivot, no saturation, exact.
 //
-// IMPLEMENTATION: per (head, chunk) the work is split across the two Vec
-//   sub-blocks by row range (vid=0 -> rows [0,C/2), vid=1 -> rows [C/2, C)),
-//   mirroring the GDN scaled_dot_kkt row split.  Each vid loops over columns c
+// IMPLEMENTATION: a work item is one (chunk, head, column block).  The kernel
+//   picks the column block width itself, scoring each candidate width by
+//   ceil(items / get_block_num()) * columns_per_item, so a short sequence
+//   splits into enough items to fill every lane; ties go to the widest block,
+//   which pays the fewest per-item prologues.  Each item walks its columns c
 //   and computes its rows' column-c of L via a per-column elementwise
 //   reduction:
 //
 //     diff[r,d] = g_cs[my_row r, d] - g_cs[c, d]   (TCOLEXPANDSUB, per-dim c)
-//     diff      = min(diff, 0)                       (TMINS)
-//     t[r,d]    = exp(diff) * k[c,d] * k[my_row r,d] (TEXP, TCOLEXPANDMUL,
-//     TMUL) L[my_row r, c] = beta[r] * sum_d t[r,d]        (TROWSUM, TMUL)
+//     t[r,d]    = exp(diff) * kb[c,d] * k[my_row r,d]
+//                                                  (TEXP, TCOLEXPANDMUL, TMUL)
+//     L[my_row r, c] = sum_d t[r,d]                (TROWSUM)
 //
-//   then stores the strict-lower rows (global_row > c) to L_out.  This is a
+//   where kb = k * beta is built once per chunk, so no per-column beta
+//   multiply is left.  The strict-lower mask is a computed step on the
+//   leading rows, not a gathered [C, C] tensor.
+//   Then it stores the strict-lower rows (global_row > c) to L_out.  This is a
 //   Vec-only kernel; the Cube pass only participates in the entry/exit
 //   barriers. (A GEMM-accelerated off-diagonal path is a future optimization.)
 //
@@ -170,12 +174,6 @@ AICORE inline void kda_kkt_kernel(__gm__ half* k_ptr, __gm__ float* g_cs_ptr,
   // 1).
   using GmHalfLoutCol =
       GlobalTensor<half, GmShapeDyn, Stride<1, 1, 1, NumHeads * ChunkSize, 1>>;
-  // Strict-lower mask [C, C]; read one column c as a [my_rows, 1] strip where
-  // the row dim steps down by ChunkSize and the single column is contiguous
-  // (innermost stride 1 — the only pattern TLOAD honours for a gather).
-  using GmFloatMaskColRow =
-      GlobalTensor<float, GmShapeDyn, Stride<1, 1, 1, ChunkSize, 1>>;
-
   set_mask_norm();
   set_vector_mask(-1, -1);
 
@@ -390,8 +388,11 @@ AICORE inline void kda_kkt_kernel(__gm__ half* k_ptr, __gm__ float* g_cs_ptr,
       // (my_off + r <= c) -- and those are exactly the rows the strict-lower
       // step below overwrites with zero, so an inf or NaN there never
       // reaches L_out.  Rows are independent through TROWSUM, so a poisoned
-      // row cannot contaminate a kept one.  Saves a full-tile TMINS and its
-      // barrier per column.
+      // row cannot contaminate a kept one.  A short chunk is no exception:
+      // every tile here is sized to my_rows, the live row count, so there are
+      // no zero-padded rows carrying g_cs = 0 into the exp -- the trap
+      // kda_chunk_o does fall into, because it pads its tiles out to HalfC.
+      // Saves a full-tile TMINS and its barrier per column.
       TEXP(diff, diff);
       PipeBarrierVec();
       // *= k[c,d]  (per-dim broadcast), then *= k[my r, d]
@@ -443,8 +444,8 @@ AICORE inline void kda_kkt_kernel(__gm__ half* k_ptr, __gm__ float* g_cs_ptr,
       }
       set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-      // Drain all pipes before the next column iteration so its gc/kc/
-      // mask loads (MTE2) cannot race the current column's still-draining
+      // Drain all pipes before the next column iteration so its gc/kc
+      // loads (MTE2) cannot race the current column's still-draining
       // Vec reads of the same UB slots.
       pipe_barrier(PIPE_ALL);
     }
