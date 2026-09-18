@@ -167,9 +167,17 @@ AICORE inline void kda_kkt_kernel(__gm__ half* k_ptr, __gm__ float* g_cs_ptr,
 
   for (int64_t pid = static_cast<int64_t>(lane); pid < total_work;
        pid += static_cast<int64_t>(num_lanes)) {
-    // Decode work item: (global chunk index, head_idx, row_half).
-    const int32_t row_half = static_cast<int32_t>(pid % 2);
-    const int64_t hc = pid / 2;
+    // Decode work item: (global chunk index, head_idx, row_half).  The two
+    // halves are not the same size -- the upper half walks all ChunkSize
+    // columns while the lower half stops at ChunkSize/2 -- so order every
+    // upper half before every lower half.  Interleaving them by parity gave
+    // a lane that gets two items two of the same size, and when there are
+    // more items than lanes the makespan is then two long ones instead of a
+    // long one plus a short one.
+    const int64_t half_work = total_work / 2;
+    const bool upper = pid < half_work;
+    const int32_t row_half = upper ? 1 : 0;
+    const int64_t hc = upper ? pid : pid - half_work;
     const int32_t head_idx = static_cast<int32_t>(hc % NumHeads);
     int64_t ci = hc / NumHeads;
     const int32_t my_off = row_half * HalfChunk;
