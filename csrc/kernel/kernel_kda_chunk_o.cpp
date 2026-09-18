@@ -360,9 +360,11 @@ AICORE void kda_chunk_o_kernel(__gm__ half* Q_handle, __gm__ half* K_handle,
 #if defined(__DAV_VEC__)
 
   // ── Vec UB address plan (192 KB budget) ──────────────────────────────────
-  // MASK_UB [HalfC, C] fp32 — loaded once; used in every chunk.
-  constexpr int32_t MASK_UB_ADDR = 0;
-  constexpr int32_t SLOT_A_ADDR = MASK_UB_ADDR + HalfC * C * sizeof(float);
+  // This half's own K rows, kept resident for the whole chunk.  Occupies
+  // the region the GM-gathered mask used before the mask became a computed
+  // step, so the UB high-water mark does not move.
+  constexpr int32_t KROW_ADDR = 0;
+  constexpr int32_t SLOT_A_ADDR = KROW_ADDR + HalfC * K_DIM * sizeof(float);
   constexpr int32_t SLOT_B_ADDR = SLOT_A_ADDR + HalfC * K_DIM * sizeof(float);
   constexpr int32_t SLOT_C_ADDR = SLOT_B_ADDR + HalfC * K_DIM * sizeof(float);
   constexpr int32_t SLOT_D_ADDR = SLOT_C_ADDR + HalfC * K_DIM * sizeof(float);
@@ -405,6 +407,9 @@ AICORE void kda_chunk_o_kernel(__gm__ half* Q_handle, __gm__ half* K_handle,
     TASSIGN(q_ub, SLOT_B_ADDR);
     TileUbDataND<float, HalfC, K_DIM, HalfC, K_DIM> exp_ub;
     TASSIGN(exp_ub, SLOT_C_ADDR);
+    TileUbDataND<float, HalfC, K_DIM, HalfC, K_DIM, pto::PadValue::Zero>
+        krow_ub;
+    TASSIGN(krow_ub, KROW_ADDR);
 
     // (A.1) Load Q and G_cs (head-major fp16).
     if (valid_rows > 0) {
@@ -446,11 +451,36 @@ AICORE void kda_chunk_o_kernel(__gm__ half* Q_handle, __gm__ half* K_handle,
           TFILLPAD_INPLACE(g_stg_full, g_load);
         }
       }
+      {
+        GmShape2D k_shape(valid_rows, K_DIM);
+        GmStride2D k_stride(HM_STRIDE);
+        GmTensor2D<half> k_global(K_handle + hk_base, k_shape, k_stride);
+        // Stage in SLOT_C, not SLOT_D: the Q cast just above still reads
+        // SLOT_D on the vector pipe, and an MTE2 load into it would be a
+        // write-after-read race.  SLOT_C is free until (A.2) writes exp_ub.
+        TileUbDataND<half, HalfC, K_DIM, HalfC, K_DIM, pto::PadValue::Zero>
+            k_stg_full;
+        TASSIGN(k_stg_full, SLOT_C_ADDR);
+        DynVecTile<half, HalfC, K_DIM, pto::PadValue::Zero> k_load(valid_rows,
+                                                                   K_DIM);
+        TASSIGN(k_load, SLOT_C_ADDR);
+        TLOAD(k_load, k_global);
+        if (valid_rows != HalfC) {
+          TFILLPAD_INPLACE(k_stg_full, k_load);
+        }
+      }
       set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+      {
+        TileUbDataND<half, HalfC, K_DIM, HalfC, K_DIM> k_stg_cvt;
+        TASSIGN(k_stg_cvt, SLOT_C_ADDR);
+        TCVT(krow_ub, k_stg_cvt, pto::RoundMode::CAST_NONE);
+        PipeBarrierVec();
+      }
     } else {
       TEXPANDS(q_ub, 0.0f);
       TEXPANDS(g_ub, 0.0f);
+      TEXPANDS(krow_ub, 0.0f);
     }
 
     // (A.2) q_eff = Q * exp(g_cs).
@@ -521,34 +551,46 @@ AICORE void kda_chunk_o_kernel(__gm__ half* Q_handle, __gm__ half* K_handle,
       const bool has_padded_rows =
           static_cast<int32_t>(valid) < my_row_offset + HalfC;
       for (int32_t c = 0; c < aqk_col_end; ++c) {
-        int64_t col_base = static_cast<int64_t>(head) * total_tokens * K_DIM +
-                           (chunk_start + static_cast<int64_t>(c)) * K_DIM;
-        {
-          GmShape2D cs(1, K_DIM);
-          GmStride2D cst(K_DIM);
-          GmTensor2D<float> gc_gm(G_handle + col_base, cs, cst);
-          TileUbDataND<float, 1, K_DIM, 1, K_DIM> gc_ld;
-          TASSIGN(gc_ld, AQK_GC);
-          TLOAD(gc_ld, gc_gm);
-          GmTensor2D<half> kc_gm(K_handle + col_base, cs, cst);
-          TileUbDataND<half, 1, K_DIM, 1, K_DIM> kc_ld;
-          TASSIGN(kc_ld, AQK_KCH);
-          TLOAD(kc_ld, kc_gm);
+        // Column c is row c of the chunk.  When it is one of this half's
+        // own rows it is already in UB, in g_ub and krow_ub -- point at that
+        // row instead of gathering the row from GM, waiting on an MTE2->V
+        // pair and casting it.  The lower half owns every column it walks;
+        // the upper half owns the second half of them.
+        const int32_t c_local = c - my_row_offset;
+        if (c_local < 0) {
+          int64_t col_base = static_cast<int64_t>(head) * total_tokens * K_DIM +
+                             (chunk_start + static_cast<int64_t>(c)) * K_DIM;
+          {
+            GmShape2D cs(1, K_DIM);
+            GmStride2D cst(K_DIM);
+            GmTensor2D<float> gc_gm(G_handle + col_base, cs, cst);
+            TileUbDataND<float, 1, K_DIM, 1, K_DIM> gc_ld;
+            TASSIGN(gc_ld, AQK_GC);
+            TLOAD(gc_ld, gc_gm);
+            GmTensor2D<half> kc_gm(K_handle + col_base, cs, cst);
+            TileUbDataND<half, 1, K_DIM, 1, K_DIM> kc_ld;
+            TASSIGN(kc_ld, AQK_KCH);
+            TLOAD(kc_ld, kc_gm);
+          }
+          set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+          wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+          {
+            TileUbDataND<half, 1, K_DIM, 1, K_DIM> kc_h;
+            TASSIGN(kc_h, AQK_KCH);
+            TileUbDataND<float, 1, K_DIM, 1, K_DIM> kc_f;
+            TASSIGN(kc_f, AQK_KC);
+            TCVT(kc_f, kc_h, pto::RoundMode::CAST_NONE);
+            PipeBarrierVec();
+          }
         }
-        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-        {
-          TileUbDataND<half, 1, K_DIM, 1, K_DIM> kc_h;
-          TASSIGN(kc_h, AQK_KCH);
-          TileUbDataND<float, 1, K_DIM, 1, K_DIM> kc_f;
-          TASSIGN(kc_f, AQK_KC);
-          TCVT(kc_f, kc_h, pto::RoundMode::CAST_NONE);
-          PipeBarrierVec();
-        }
+        const int32_t gc_addr =
+            c_local < 0 ? AQK_GC : SLOT_A_ADDR + c_local * K_DIM * 4;
+        const int32_t kc_addr =
+            c_local < 0 ? AQK_KC : KROW_ADDR + c_local * K_DIM * 4;
         TileUbDataND<float, 1, K_DIM, 1, K_DIM> gc;
-        TASSIGN(gc, AQK_GC);
+        TASSIGN(gc, gc_addr);
         TileUbDataND<float, 1, K_DIM, 1, K_DIM> kc;
-        TASSIGN(kc, AQK_KC);
+        TASSIGN(kc, kc_addr);
         TileUbDataND<float, HalfC, K_DIM, HalfC, K_DIM> diff;
         TASSIGN(diff, SLOT_C_ADDR);
         TileUbDataND<float, HalfC, K_DIM, HalfC, K_DIM> tmp;
