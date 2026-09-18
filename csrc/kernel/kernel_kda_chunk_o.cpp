@@ -502,7 +502,17 @@ AICORE void kda_chunk_o_kernel(__gm__ half* Q_handle, __gm__ half* K_handle,
         wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
       }
 
-      for (int32_t c = 0; c < static_cast<int32_t>(valid); ++c) {
+      // With an inclusive lower-tri mask a row is kept for column c only
+      // when my_row_offset + r >= c, so this half's last row bounds the
+      // columns it can contribute to.  The lower half (rows 0..HalfC-1) used
+      // to walk all `valid` columns and mask every one of the upper ones to
+      // zero -- half its iterations were pure waste.  WS_QK is pre-zeroed,
+      // so simply not writing those columns leaves the same result.
+      const int32_t aqk_col_end =
+          (my_row_offset + HalfC) < static_cast<int32_t>(valid)
+              ? (my_row_offset + HalfC)
+              : static_cast<int32_t>(valid);
+      for (int32_t c = 0; c < aqk_col_end; ++c) {
         int64_t col_base = static_cast<int64_t>(head) * total_tokens * K_DIM +
                            (chunk_start + static_cast<int64_t>(c)) * K_DIM;
         {
