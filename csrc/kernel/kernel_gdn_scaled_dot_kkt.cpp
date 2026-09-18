@@ -186,6 +186,10 @@ AICORE void kkt_kernel(__gm__ half* K_handle, __gm__ half* Beta_handle,
       WaitBothVecOnA5<PIPE_MTE2>(2 + slot);
       pipe_barrier(PIPE_ALL);
 #endif
+      // The previous chunk's fixpipe store must finish draining L0C before
+      // this chunk's TMATMUL overwrites it.
+      set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+      wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
 
       int64_t chunk_start = ci * ChunkSize;
       int64_t remaining = slen - chunk_start;
