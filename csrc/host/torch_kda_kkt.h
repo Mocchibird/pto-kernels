@@ -70,15 +70,16 @@ at::Tensor run_kda_kkt(const at::Tensor& K, const at::Tensor& G_cs,
   // KDA_KKT_C compile-time constant — matches kernel default build
   constexpr int64_t CHUNK_C = 128;
 
-  // Work items are (chunk, head, row_half) and chunks are independent, so the
-  // item count grows with the sequence length rather than being fixed at
-  // batch_size*num_heads*2.  This is a Vec-only kernel, so the lanes to fill
-  // are the AIV cores; the kernel's flat enumeration idles any lane that has
-  // no item left.
+  // Work items are the three HalfChunk x HalfChunk blocks of L per (chunk,
+  // head) that are not entirely above the diagonal, and chunks are
+  // independent, so the item count grows with the sequence length rather
+  // than being fixed at batch_size*num_heads.  This is a Vec-only kernel, so
+  // the lanes to fill are the AIV cores; the kernel's flat enumeration idles
+  // any lane that has no item left.
   uint32_t block_dim = GetNumVectorCores();
   if (cu_seqlens.numel() == 1) {
     const int64_t chunks_per_seq = (seq_len + CHUNK_C - 1) / CHUNK_C;
-    const int64_t total_work = batch_size * chunks_per_seq * num_heads * 2;
+    const int64_t total_work = batch_size * chunks_per_seq * num_heads * 3;
     if (static_cast<int64_t>(block_dim) > total_work) {
       block_dim = static_cast<uint32_t>(total_work);
     }
