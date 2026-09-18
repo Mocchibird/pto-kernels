@@ -111,7 +111,14 @@ AICORE inline void kda_kkt_kernel(__gm__ half* k_ptr, __gm__ float* g_cs_ptr,
   } else {
     total_chunks = num_seqs * ((seq_len + ChunkSize - 1) / ChunkSize);
   }
-  const int64_t total_work = total_chunks * NumHeads * 2;
+  // Three equal work items per (chunk, head), each a HalfChunk x HalfChunk
+  // block of L:  slot 0 = rows [0, C/2) x cols [0, C/2),
+  //              slot 1 = rows [C/2, C) x cols [0, C/2),
+  //              slot 2 = rows [C/2, C) x cols [C/2, C).
+  // (Rows [0, C/2) x cols [C/2, C) is entirely above the diagonal.)
+  // Splitting by rows alone gave one item of C columns and one of C/2, and
+  // an uneven item is what the makespan is made of.
+  const int64_t total_work = total_chunks * NumHeads * 3;
 
   // ── GM type aliases (head-major [HV, T, K]) ──────────────────────────────
   using GmShapeDyn = Shape<1, 1, 1, DYNAMIC, DYNAMIC>;
@@ -167,20 +174,15 @@ AICORE inline void kda_kkt_kernel(__gm__ half* k_ptr, __gm__ float* g_cs_ptr,
 
   for (int64_t pid = static_cast<int64_t>(lane); pid < total_work;
        pid += static_cast<int64_t>(num_lanes)) {
-    // Decode work item: (global chunk index, head_idx, row_half).  The two
-    // halves are not the same size -- the upper half walks all ChunkSize
-    // columns while the lower half stops at ChunkSize/2 -- so order every
-    // upper half before every lower half.  Interleaving them by parity gave
-    // a lane that gets two items two of the same size, and when there are
-    // more items than lanes the makespan is then two long ones instead of a
-    // long one plus a short one.
-    const int64_t half_work = total_work / 2;
-    const bool upper = pid < half_work;
-    const int32_t row_half = upper ? 1 : 0;
-    const int64_t hc = upper ? pid : pid - half_work;
+    // Decode work item: (global chunk index, head_idx, block slot).
+    const int32_t slot = static_cast<int32_t>(pid % 3);
+    const int64_t hc = pid / 3;
     const int32_t head_idx = static_cast<int32_t>(hc % NumHeads);
     int64_t ci = hc / NumHeads;
+    const int32_t row_half = slot == 0 ? 0 : 1;
+    const int32_t col_block = slot == 2 ? 1 : 0;
     const int32_t my_off = row_half * HalfChunk;
+    const int32_t col_begin = col_block * HalfChunk;
 
     // Resolve the global chunk index to its sequence.  The varlen scan is
     // over num_seqs scalars, which is negligible next to the chunk body.
@@ -210,10 +212,14 @@ AICORE inline void kda_kkt_kernel(__gm__ half* k_ptr, __gm__ float* g_cs_ptr,
     const int32_t my_rows = my_rows_raw > HalfChunk ? HalfChunk : my_rows_raw;
     if (my_rows <= 0) continue;  // no rows for this vid in this chunk
 
-    // Columns this vid must cover: c in [0, col_end).  A row r is kept
-    // for column c only if global_row(r) > c, so the largest column any
-    // of my rows touches is (my_off + my_rows - 1).
-    const int32_t col_end = my_off + my_rows;  // exclusive upper bound for c
+    // Columns this item must cover: c in [col_begin, col_end).  A row r is
+    // kept for column c only if global_row(r) > c, so the largest column any
+    // of my rows touches is (my_off + my_rows - 1); the slot also caps it at
+    // its own column block.
+    const int32_t col_cap = col_begin + HalfChunk;
+    const int32_t rows_cap = my_off + my_rows;
+    const int32_t col_end = rows_cap < col_cap ? rows_cap : col_cap;
+    if (col_begin >= col_end) continue;  // block is entirely above the diagonal
 
     const int64_t hbase =
         static_cast<int64_t>(head_idx) * total_tokens * KDim;
@@ -290,7 +296,7 @@ AICORE inline void kda_kkt_kernel(__gm__ half* k_ptr, __gm__ float* g_cs_ptr,
     PipeBarrierVec();
 
     // ── Column loop ──────────────────────────────────────────────────
-    for (int32_t c = 0; c < col_end; ++c) {
+    for (int32_t c = col_begin; c < col_end; ++c) {
       // Column c's g_cs and k.  Columns in [my_off, my_off + my_rows) are my
       // own rows, whose g_cs (myg) and fp32 k (myk) are already in UB, so
       // point at row c - my_off instead of re-reading GM and re-casting.
