@@ -329,21 +329,21 @@ AICORE inline void kda_kkt_kernel(__gm__ half* k_ptr, __gm__ float* g_cs_ptr,
       TROWSUM(colsum, diff, tmp);
       PipeBarrierVec();
 
-      // Strict-lower mask: load mask[my_off+r, c] as a padded [my_rows,1]
-      // strip (row-strided gather, innermost contiguous) and zero the
-      // upper-tri rows (my_off+r <= c) via elementwise TMUL.
-      {
-        UbND<float, HalfChunk, 16, DYNAMIC, DYNAMIC> mk(my_rows, 1);
-        TASSIGN(mk, MSKC_ADDR);
-        GmShapeDyn gs;
-        gs.shape[3] = my_rows;
-        gs.shape[4] = 1;
-        GmFloatMaskColRow mk_gm(
-            mask_ptr + static_cast<int64_t>(my_off) * ChunkSize + c, gs);
-        TLOAD(mk, mk_gm);
-        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-        TMUL(colsum, colsum, mk);
+      // Strict-lower mask.  The kept rows for column c are exactly those
+      // with my_off + r > c, so the mask is a step: zero the leading
+      // c - my_off + 1 rows of colsum and leave the rest.  Writing those
+      // rows with TEXPANDS replaces a strided [my_rows,1] gather from GM
+      // plus its MTE2->V flag pair and a TMUL, and for the upper half it
+      // is skipped entirely while c < my_off.
+      const int32_t zero_rows_raw = c - my_off + 1;
+      const int32_t zero_rows =
+          zero_rows_raw < 0
+              ? 0
+              : (zero_rows_raw > my_rows ? my_rows : zero_rows_raw);
+      if (zero_rows > 0) {
+        UbND<float, HalfChunk, 16, DYNAMIC, DYNAMIC> mk0(zero_rows, 1);
+        TASSIGN(mk0, COL_ADDR);
+        TEXPANDS(mk0, 0.0f);
         PipeBarrierVec();
       }
 
