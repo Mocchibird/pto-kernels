@@ -324,9 +324,13 @@ AICORE inline void kda_kkt_kernel(__gm__ half* k_ptr, __gm__ float* g_cs_ptr,
       // diff[r,d] = g_cs[my r, d] - g_cs[c, d]
       TCOLEXPANDSUB(diff, myg, gc);
       PipeBarrierVec();
-      // clamp to <= 0 so exp(.) is finite for masked (r<c) entries too
-      TMINS(diff, diff, 0.0f);
-      PipeBarrierVec();
+      // No clamp before the exp.  The argument is > 0 only where
+      // g_cs[my r] > g_cs[c], i.e. only for rows above the diagonal
+      // (my_off + r <= c) -- and those are exactly the rows the strict-lower
+      // step below overwrites with zero, so an inf or NaN there never
+      // reaches L_out.  Rows are independent through TROWSUM, so a poisoned
+      // row cannot contaminate a kept one.  Saves a full-tile TMINS and its
+      // barrier per column.
       TEXP(diff, diff);
       PipeBarrierVec();
       // *= k[c,d]  (per-dim broadcast), then *= k[my r, d]
