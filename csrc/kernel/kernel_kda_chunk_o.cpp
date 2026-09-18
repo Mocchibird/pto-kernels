@@ -512,6 +512,14 @@ AICORE void kda_chunk_o_kernel(__gm__ half* Q_handle, __gm__ half* K_handle,
           (my_row_offset + HalfC) < static_cast<int32_t>(valid)
               ? (my_row_offset + HalfC)
               : static_cast<int32_t>(valid);
+      // g_ub and q_ub are TFILLPAD-zeroed past valid_rows, so in a short
+      // chunk the padded rows carry g_cs = 0 and their exp argument
+      // 0 - g_cs[c] is large and positive.  Those rows sit BELOW the
+      // diagonal, so the mask step does not clear them, and without a clamp
+      // they put inf into the padded rows of WS_QK.  Only a short chunk pays
+      // for the clamp; a full one keeps the faster unclamped path.
+      const bool has_padded_rows =
+          static_cast<int32_t>(valid) < my_row_offset + HalfC;
       for (int32_t c = 0; c < aqk_col_end; ++c) {
         int64_t col_base = static_cast<int64_t>(head) * total_tokens * K_DIM +
                            (chunk_start + static_cast<int64_t>(c)) * K_DIM;
@@ -550,11 +558,17 @@ AICORE void kda_chunk_o_kernel(__gm__ half* Q_handle, __gm__ half* K_handle,
 
         TCOLEXPANDSUB(diff, g_ub, gc);
         PipeBarrierVec();
-        // No clamp before the exp.  g_cs is monotone decreasing within a
-        // chunk, so g_cs[r] - g_cs[c] is positive only for r < c -- the
-        // rows above the diagonal, which the inclusive-mask step below
-        // overwrites with zero.  TROWSUM keeps rows independent, so an inf
-        // or NaN there cannot reach WS_QK or contaminate a kept row.
+        // No clamp before the exp for a full chunk.  g_cs is monotone
+        // decreasing within one, so g_cs[r] - g_cs[c] is positive only for
+        // r < c -- the rows above the diagonal, which the inclusive-mask
+        // step below overwrites with zero.  TROWSUM keeps rows independent,
+        // so an inf or NaN there cannot reach WS_QK or contaminate a kept
+        // row.  A short chunk breaks that invariant through its zero-padded
+        // rows, so it keeps the clamp.
+        if (has_padded_rows) {
+          TMINS(diff, diff, 0.0f);
+          PipeBarrierVec();
+        }
         TEXP(diff, diff);
         PipeBarrierVec();
         TCOLEXPANDMUL(diff, diff, kc);
