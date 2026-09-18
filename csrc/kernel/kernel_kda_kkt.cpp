@@ -111,14 +111,51 @@ AICORE inline void kda_kkt_kernel(__gm__ half* k_ptr, __gm__ float* g_cs_ptr,
   } else {
     total_chunks = num_seqs * ((seq_len + ChunkSize - 1) / ChunkSize);
   }
-  // Three equal work items per (chunk, head), each a HalfChunk x HalfChunk
-  // block of L:  slot 0 = rows [0, C/2) x cols [0, C/2),
-  //              slot 1 = rows [C/2, C) x cols [0, C/2),
-  //              slot 2 = rows [C/2, C) x cols [C/2, C).
-  // (Rows [0, C/2) x cols [C/2, C) is entirely above the diagonal.)
-  // Splitting by rows alone gave one item of C columns and one of C/2, and
-  // an uneven item is what the makespan is made of.
-  const int64_t total_work = total_chunks * NumHeads * 3;
+  // Work items are HalfChunk x ColBlock blocks of L.  The lower row half
+  // only reaches column HalfChunk-1 so it contributes HalfChunk/ColBlock of
+  // them; the upper half spans the chunk and contributes ChunkSize/ColBlock.
+  // Blocks entirely above the diagonal are never emitted, and every item is
+  // the same size, so the makespan is one block.
+  //
+  // ColBlock is picked here rather than fixed, because the right width
+  // depends on how many items the shape yields against how many run at
+  // once: a short sequence with wide blocks leaves lanes idle, while a long
+  // one with narrow blocks pays the per-item prologue (the row g_cs/k/beta
+  // loads and mykb) too many times.  Cost of a candidate is (rounds it
+  // needs) x (columns per item); ties go to the widest block, which pays
+  // that prologue fewest times.
+  //
+  // The divisor is get_block_num(), not num_lanes.  Work is still handed out
+  // across all num_lanes lanes, but measured makespan scales with
+  // items/get_block_num() on both parts: on A2A3 num_lanes is twice
+  // get_block_num() (two Vec sub-blocks per block) and yet doubling the item
+  // count from 48 to 96 doubles the time, so the sub-blocks do not add
+  // concurrency here.  Using num_lanes made this pick ColBlock 32 at T=512
+  // on A2A3 and cost 4.7%.
+  //
+  // Every lane runs the same arithmetic on the same inputs, so they all
+  // choose the same width and agree on the decode.
+  static_assert(HalfChunk % 8 == 0,
+                "Fix: ChunkSize/2 must be a multiple of 8 for the ColBlock "
+                "search to reach every candidate width.");
+  const int64_t units = total_chunks * NumHeads;
+  int32_t ColBlock = HalfChunk;
+  int64_t best_cost = -1;
+  for (int32_t cb = HalfChunk; cb >= 8; cb >>= 1) {
+    const int64_t slots = (ChunkSize / cb) + (HalfChunk / cb);
+    const int64_t items = units * slots;
+    const int64_t concurrency = static_cast<int64_t>(get_block_num());
+    const int64_t rounds = (items + concurrency - 1) / concurrency;
+    const int64_t cost = rounds * static_cast<int64_t>(cb);
+    if (best_cost < 0 || cost < best_cost) {
+      best_cost = cost;
+      ColBlock = cb;
+    }
+  }
+  const int32_t LowerBlocks = HalfChunk / ColBlock;
+  const int32_t UpperBlocks = ChunkSize / ColBlock;
+  const int32_t SlotsPerChunkHead = LowerBlocks + UpperBlocks;
+  const int64_t total_work = units * static_cast<int64_t>(SlotsPerChunkHead);
 
   // ── GM type aliases (head-major [HV, T, K]) ──────────────────────────────
   using GmShapeDyn = Shape<1, 1, 1, DYNAMIC, DYNAMIC>;
@@ -175,14 +212,14 @@ AICORE inline void kda_kkt_kernel(__gm__ half* k_ptr, __gm__ float* g_cs_ptr,
   for (int64_t pid = static_cast<int64_t>(lane); pid < total_work;
        pid += static_cast<int64_t>(num_lanes)) {
     // Decode work item: (global chunk index, head_idx, block slot).
-    const int32_t slot = static_cast<int32_t>(pid % 3);
-    const int64_t hc = pid / 3;
+    const int32_t slot = static_cast<int32_t>(pid % SlotsPerChunkHead);
+    const int64_t hc = pid / SlotsPerChunkHead;
     const int32_t head_idx = static_cast<int32_t>(hc % NumHeads);
     int64_t ci = hc / NumHeads;
-    const int32_t row_half = slot == 0 ? 0 : 1;
-    const int32_t col_block = slot == 2 ? 1 : 0;
+    const int32_t row_half = slot < LowerBlocks ? 0 : 1;
+    const int32_t col_block = slot < LowerBlocks ? slot : slot - LowerBlocks;
     const int32_t my_off = row_half * HalfChunk;
-    const int32_t col_begin = col_block * HalfChunk;
+    const int32_t col_begin = col_block * ColBlock;
 
     // Resolve the global chunk index to its sequence.  The varlen scan is
     // over num_seqs scalars, which is negligible next to the chunk body.
@@ -216,7 +253,7 @@ AICORE inline void kda_kkt_kernel(__gm__ half* k_ptr, __gm__ float* g_cs_ptr,
     // kept for column c only if global_row(r) > c, so the largest column any
     // of my rows touches is (my_off + my_rows - 1); the slot also caps it at
     // its own column block.
-    const int32_t col_cap = col_begin + HalfChunk;
+    const int32_t col_cap = col_begin + ColBlock;
     const int32_t rows_cap = my_off + my_rows;
     const int32_t col_end = rows_cap < col_cap ? rows_cap : col_cap;
     if (col_begin >= col_end) continue;  // block is entirely above the diagonal
